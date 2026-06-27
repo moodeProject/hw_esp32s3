@@ -7,9 +7,9 @@
 #define SDA_PIN 5
 #define SCL_PIN 6
 
-const char* ssid      = //TODO:이름 입력 ;
-const char* password  = //TODO:비밀번호 입력 "";
-const char* serverURL = //TODO: IP주소 입력 "http://[]:8080/api/sensor-data";
+const char* ssid      = "AndroidHotspot8205" ;
+const char* password  = "jk008532!!";
+const char* serverURL = "https://entertain-delirium-nicotine.ngrok-free.dev/api/sensor-data";
 const char* deviceId  = "HELMET-001";
 
 void setup() {
