@@ -7,9 +7,9 @@
 #define SDA_PIN 5
 #define SCL_PIN 6
 
-const char* ssid      = "AndroidHotspot8205" ;
-const char* password  = "jk008532!!";
-const char* serverURL = "https://entertain-delirium-nicotine.ngrok-free.dev/api/sensor-data";
+const char* ssid      = "TODO";  // 각자 환경에 맞게 채워서 사용 (커밋 금지)
+const char* password  = "TODO";
+const char* serverURL = "TODO";  // ngrok 등 임시 주소는 계속 바뀌므로 커밋하지 않음
 const char* deviceId  = "HELMET-001";
 
 void setup() {
