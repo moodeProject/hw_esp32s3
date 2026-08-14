@@ -85,20 +85,20 @@ void readMpu(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
   Wire.endTransmission(false);
   Wire.requestFrom(MPU_ADDR, 14);
 
-  int16_t ax_raw = Wire.read() << 8 | Wire.read();
-  int16_t ay_raw = Wire.read() << 8 | Wire.read();
-  int16_t az_raw = Wire.read() << 8 | Wire.read();
+  int16_t axRaw = Wire.read() << 8 | Wire.read();
+  int16_t ayRaw = Wire.read() << 8 | Wire.read();
+  int16_t azRaw = Wire.read() << 8 | Wire.read();
   Wire.read(); Wire.read();  // temperature, 사용 안 함
-  int16_t gx_raw = Wire.read() << 8 | Wire.read();
-  int16_t gy_raw = Wire.read() << 8 | Wire.read();
-  int16_t gz_raw = Wire.read() << 8 | Wire.read();
+  int16_t gxRaw = Wire.read() << 8 | Wire.read();
+  int16_t gyRaw = Wire.read() << 8 | Wire.read();
+  int16_t gzRaw = Wire.read() << 8 | Wire.read();
 
-  ax = ax_raw / 16384.0f * 9.8f;  // g -> m/s^2 (posture_alert_logic.py와 스케일 맞춤)
-  ay = ay_raw / 16384.0f * 9.8f;
-  az = az_raw / 16384.0f * 9.8f;
-  gx = gx_raw / 131.0f;
-  gy = gy_raw / 131.0f;
-  gz = gz_raw / 131.0f;
+  ax = axRaw / 16384.0f * 9.8f;  // g -> m/s^2 (postureAlertLogic.py와 스케일 맞춤)
+  ay = ayRaw / 16384.0f * 9.8f;
+  az = azRaw / 16384.0f * 9.8f;
+  gx = gxRaw / 131.0f;
+  gy = gyRaw / 131.0f;
+  gz = gzRaw / 131.0f;
 }
 
 // ═══════════════════════════════════════════════════════
