@@ -47,9 +47,14 @@ const float THRESH_COLLAPSE_SLOPE     = 0.0f;    // deg/sample (실측 slope 중
 // ── WiFi / 서버 ────────────────────────────────────────────
 const char* ssid      = "TODO";  // 각자 환경에 맞게 채워서 사용 (커밋 금지)
 const char* password   = "TODO";
-const char* serverURL = "http://192.168.0.10:8080/api/safety-event";
+// 실제 배포된 서버 주소 + 엔드포인트. 서버(Spring)의 SensorDataController가
+// "/api/sensor-data"로 열려있고, raw IMU(ax~gz)를 필수로 요구한다.
+// TODO: 백엔드가 "/api/v1" 프리픽스를 실제로 붙이면(현재 미적용) 아래 경로도 맞춰서
+// "/api/v1/sensor-data"로 유지 — 서버 쪽 반영 전까지는 404 날 수 있으니 배포 타이밍 확인 필요.
+const char* serverURL = "http://13.209.96.183:8080/api/v1/sensor-data";
 const char* deviceId   = "HELMET-001";
-const char* ZONE_ID    = "TODO-ZONE";   // 비콘 파트 연동 전까지 임시값
+// zoneId는 서버 SensorDataRequest DTO에 아직 필드가 없어서(비콘 브랜치 미반영)
+// 지금은 보내지 않는다. 필드 추가되면 다시 포함.
 
 // ── 상태 enum ──────────────────────────────────────────────
 enum class PostureStatus { STABLE, STUMBLE, COLLAPSE };
@@ -65,7 +70,9 @@ SafetyLevel determineSafetyLevel(PostureStatus posture, bool healthAbnormal);
 void soundBuzzer(SafetyLevel level);
 const char* levelToStr(SafetyLevel level);
 const char* postureToStr(PostureStatus posture);
-void sendSafetyEvent(SafetyLevel level, PostureStatus posture, bool healthAbnormal);
+const char* healthOnlyLevelToStr(bool healthAbnormal);
+void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz,
+                     PostureStatus posture, bool healthAbnormal);
 
 // ── 링버퍼 ─────────────────────────────────────────────────
 float bufAx[POSTURE_WINDOW_SIZE], bufAy[POSTURE_WINDOW_SIZE], bufAz[POSTURE_WINDOW_SIZE];
@@ -203,9 +210,19 @@ const char* postureToStr(PostureStatus posture) {
   }
 }
 
-void sendSafetyEvent(SafetyLevel level, PostureStatus posture, bool healthAbnormal) {
+// 서버(SensorDataServiceImpl)는 posture/healthAbnormal/level을 "독립적인 두 트랙"으로
+// 재조합한다: level은 checkHealth()에서만 쓰이고 건강 트랙 전용으로 취급되며,
+// FALLING/FALLEN 같은 추락 계열 값이 들어오면 무시하고 NORMAL로 되돌린다.
+// 그래서 온보드에서 posture+health를 합쳐 만든 4단계 값을 그대로 보내면 안 되고,
+// "건강 트랙만 반영한" 값으로 다시 계산해서 보내야 서버 로직과 의미가 맞는다.
+const char* healthOnlyLevelToStr(bool healthAbnormal) {
+  return healthAbnormal ? "RECOMMEND" : "NORMAL";
+}
+
+void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz,
+                     PostureStatus posture, bool healthAbnormal) {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WiFi 없음] 이벤트 전송 스킵 (버저는 이미 울림)");
+    Serial.println("[WiFi 없음] 센서 데이터 전송 스킵 (버저는 이미 울림)");
     return;
   }
 
@@ -213,18 +230,27 @@ void sendSafetyEvent(SafetyLevel level, PostureStatus posture, bool healthAbnorm
   http.begin(serverURL);
   http.addHeader("Content-Type", "application/json");
 
+  // 서버 SensorDataRequest는 ax~gz가 없으면 400으로 거부하므로 반드시 포함해야 한다.
   StaticJsonDocument<256> doc;
   doc["deviceId"] = deviceId;
-  doc["zoneId"] = ZONE_ID;
-  doc["level"] = levelToStr(level);
+  doc["ax"] = ax;
+  doc["ay"] = ay;
+  doc["az"] = az;
+  doc["gx"] = gx;
+  doc["gy"] = gy;
+  doc["gz"] = gz;
   doc["posture"] = postureToStr(posture);
   doc["healthAbnormal"] = healthAbnormal;
+  doc["level"] = healthOnlyLevelToStr(healthAbnormal);
+  // heartRate/spo2(MAX30102, 지원님 파트)는 지금 이 보드에 해당 센서가 없어서 생략.
+  // 서버는 null이어도 낙상 판단엔 지장 없음(건강 판단에만 영향) — 단, AI서버 쪽
+  // heartRate/spo2를 필수로 보게 되어 있다면 팀 논의 필요.
 
   String body;
   serializeJson(doc, body);
 
   int code = http.POST(body);
-  Serial.printf("[이벤트 전송] %s (응답코드 %d)\n", body.c_str(), code);
+  Serial.printf("[센서 데이터 전송] %s (응답코드 %d)\n", body.c_str(), code);
   http.end();
 }
 
@@ -280,8 +306,13 @@ void loop() {
   }
 
   // 상태가 "바뀌었을 때"만 서버로 전송 (매 20ms 스팸 방지)
+  // TODO(팀 논의 필요): 서버가 AI 서버로 raw IMU를 넘겨 급낙상을 판정하는데,
+  // AI 쪽은 50샘플 슬라이딩 윈도우라 "연속적으로 자주" 들어오는 걸 전제로 함.
+  // 지금처럼 상태 바뀔 때만 드문드문 보내면 AI 버퍼가 이어지지 않는 샘플들이라
+  // 사실상 무의미 — 전송 주기를 지속적 스트리밍으로 바꿀지는 배터리/대역폭
+  // 트레이드오프가 있어서 팀과 상의 후 결정.
   if (level != SafetyLevel::NORMAL && level != lastSentLevel) {
-    sendSafetyEvent(level, posture, healthAbnormal);
+    sendSensorData(ax, ay, az, gx, gy, gz, posture, healthAbnormal);
   }
   lastSentLevel = level;
 }
