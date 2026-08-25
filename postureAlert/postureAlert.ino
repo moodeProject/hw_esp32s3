@@ -49,9 +49,10 @@ const char* ssid      = "TODO";  // 각자 환경에 맞게 채워서 사용 (�
 const char* password   = "TODO";
 // 실제 배포된 서버 주소 + 엔드포인트. 서버(Spring)의 SensorDataController가
 // "/api/sensor-data"로 열려있고, raw IMU(ax~gz)를 필수로 요구한다.
-// TODO: 백엔드가 "/api/v1" 프리픽스를 실제로 붙이면(현재 미적용) 아래 경로도 맞춰서
-// "/api/v1/sensor-data"로 유지 — 서버 쪽 반영 전까지는 404 날 수 있으니 배포 타이밍 확인 필요.
-const char* serverURL = "http://13.209.96.183:8080/api/v1/sensor-data";
+// TODO: 백엔드가 "/api/v1" 프리픽스를 실제로 붙이면 "/api/v1/sensor-data"로 변경.
+// 현재는 백엔드에 프리픽스가 없어서(미반영 확인됨) /v1을 붙이면 404가 나므로
+// 지금 배포된 서버에 맞춰 프리픽스 없이 둔다.
+const char* serverURL = "http://13.209.96.183:8080/api/sensor-data";
 const char* deviceId   = "HELMET-001";
 // zoneId는 서버 SensorDataRequest DTO에 아직 필드가 없어서(비콘 브랜치 미반영)
 // 지금은 보내지 않는다. 필드 추가되면 다시 포함.
@@ -81,7 +82,12 @@ int bufIndex = 0;
 int bufCount = 0;
 
 unsigned long lastSampleMs = 0;
-SafetyLevel lastSentLevel = SafetyLevel::NORMAL;  // 같은 상태 반복 전송 방지
+// level만 비교하면 서로 다른 (posture, healthAbnormal) 조합이 같은 level로
+// 뭉개져서(예: STUMBLE->COLLAPSE가 둘 다 RECOMMEND) 변화가 감지 안 될 수 있다.
+// 서버가 posture 값 자체로 다르게 취급하므로(STUMBLE->ACTION_REQUIRED,
+// COLLAPSE->FALLING) posture/healthAbnormal 각각의 마지막 전송값도 따로 추적한다.
+PostureStatus lastSentPosture = PostureStatus::STABLE;
+bool lastSentHealthAbnormal = false;
 
 // ═══════════════════════════════════════════════════════
 // MPU6050 읽기
@@ -311,8 +317,10 @@ void loop() {
   // 지금처럼 상태 바뀔 때만 드문드문 보내면 AI 버퍼가 이어지지 않는 샘플들이라
   // 사실상 무의미 — 전송 주기를 지속적 스트리밍으로 바꿀지는 배터리/대역폭
   // 트레이드오프가 있어서 팀과 상의 후 결정.
-  if (level != SafetyLevel::NORMAL && level != lastSentLevel) {
+  bool changedSinceLastSend = (posture != lastSentPosture) || (healthAbnormal != lastSentHealthAbnormal);
+  if (level != SafetyLevel::NORMAL && changedSinceLastSend) {
     sendSensorData(ax, ay, az, gx, gy, gz, posture, healthAbnormal);
+    lastSentPosture = posture;
+    lastSentHealthAbnormal = healthAbnormal;
   }
-  lastSentLevel = level;
 }
