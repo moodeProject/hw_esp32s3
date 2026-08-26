@@ -24,12 +24,9 @@
 MAX30105 particleSensor;
 
 // ── 윈도우 설정 ────────────────────────────────────────────
-// posture 윈도우(3초, 50Hz)와는 별도. vitals는 값이 안정적으로 나오려면
-// 더 긴 시간이 필요해서 5초 윈도우로 잡음. loop()가 20ms마다 도니까
-// 5초 = 250 샘플.
 #define VITALS_WINDOW_SIZE 250
 
-// ── 정상 범위 (일반 성인 안정 시 기준, 필요시 실측 데이터로 재조정) ──
+// ── 정상 범위 (일반 성인 안정 시 기준, 추후 실측 데이터로 재조정) ──
 const float BPM_MIN_NORMAL   = 40.0f;
 const float BPM_MAX_NORMAL   = 140.0f;
 const float SPO2_MIN_NORMAL  = 92.0f;
@@ -38,8 +35,7 @@ const float SPO2_MIN_NORMAL  = 92.0f;
 const long IR_FINGER_THRESHOLD = 50000;  // 이 값보다 낮으면 피부 미접촉으로 간주
 
 // ── motion artifact 배제 임계값 ────────────────────────────
-// posture_alert.ino의 THRESH_STUMBLE_GYRO_STD(45.0)보다 낮은 수준에서도
-// PPG는 쉽게 깨지므로 더 보수적으로 잡음. 실착용 테스트하면서 조정 필요.
+// PPG는 쉽게 깨지므로 더 보수적으로 잡음. 실착용 테스트하면서 조정 필요
 const float GYRO_STD_MOTION_LIMIT = 20.0f;
 
 // ── 링버퍼 ─────────────────────────────────────────────────
@@ -49,7 +45,6 @@ int vitalsIndex = 0;
 int vitalsCount = 0;
 
 // ── 최근 계산 결과 캐시 ────────────────────────────────────
-// (수치는 서버로 안 보내지만, 판정 로직 내부에서는 필요해서 캐싱)
 float lastBpm = 0;
 float lastSpo2 = 0;
 bool lastVitalsAbnormal = false;

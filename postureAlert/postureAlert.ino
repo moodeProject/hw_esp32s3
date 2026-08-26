@@ -48,11 +48,12 @@ const float THRESH_COLLAPSE_SLOPE     = 0.0f;    // deg/sample (실측 slope 중
 // ── WiFi / 서버 ────────────────────────────────────────────
 const char* ssid      = "TODO";  // 각자 환경에 맞게 채워서 사용 (커밋 금지)
 const char* password   = "TODO";
-// 서버(Spring)의 SensorDataController가 "/api/sensor-data"로 열려있고,
-// raw IMU(ax~gz)를 필수로 요구한다. 엔드포인트는 이거 하나로 통일
-// (팀장님이 확인한 배포 서버는 13.209.96.183 — 오늘은 로컬 테스트 서버로
-// end-to-end 검증 완료된 10.63.140.214 유지, 배포 서버 최신화 확인되면 교체)
-const char* sensorDataURL = "http://10.63.140.214:8080/api/sensor-data";
+// 실제 배포된 서버 주소 + 엔드포인트. 서버(Spring)의 SensorDataController가
+// "/api/sensor-data"로 열려있고, raw IMU(ax~gz)를 필수로 요구한다.
+// TODO: 백엔드가 "/api/v1" 프리픽스를 실제로 붙이면 "/api/v1/sensor-data"로 변경.
+// 현재는 백엔드에 프리픽스가 없어서(미반영 확인됨) /v1을 붙이면 404가 나므로
+// 지금 배포된 서버에 맞춰 프리픽스 없이 둔다.
+const char* sensorDataURL = "http://:8080/api/sensor-data";
 const char* deviceId   = "HELMET-001";
 // zoneId는 서버 SensorDataRequest DTO에 아직 필드가 없어서(비콘 브랜치 미반영)
 // 지금은 보내지 않는다. 필드 추가되면 다시 포함.
@@ -83,7 +84,6 @@ int bufCount = 0;
 unsigned long lastSampleMs = 0;
 float latestGyroStd = 0;
 
-// AI 서버 전송용 최신 판정값 (3초 윈도우 찰 때만 갱신, 그 전엔 기본값 유지)
 PostureStatus latestPosture = PostureStatus::STABLE;
 bool latestHealthAbnormal = false;
 
@@ -196,7 +196,7 @@ void soundBuzzer(SafetyLevel level) {
 }
 
 // ═══════════════════════════════════════════════════════
-// 문자열 변환 유틸
+// 결과를 서버로 전송 (NORMAL이 아닐 때만, 상태 바뀔 때만)
 // ═══════════════════════════════════════════════════════
 const char* levelToStr(SafetyLevel level) {
   switch (level) {
@@ -215,20 +215,14 @@ const char* postureToStr(PostureStatus posture) {
 }
 
 // 서버(SensorDataServiceImpl)는 posture/healthAbnormal/level을 "독립적인 두 트랙"으로
-// 재조합한다: level은 건강 트랙 전용으로 취급되며, FALLING/FALLEN 같은 추락 계열
-// 값이 들어오면 무시하고 NORMAL로 되돌린다. 그래서 온보드에서 posture+health를
-// 합쳐 만든 3단계(SafetyLevel)를 그대로 보내면 안 되고, "건강 트랙만 반영한"
-// 값으로 다시 계산해서 보내야 서버 로직과 의미가 맞는다. (팀장님 확인 사항 반영)
+// 재조합한다: level은 checkHealth()에서만 쓰이고 건강 트랙 전용으로 취급되며,
+// FALLING/FALLEN 같은 추락 계열 값이 들어오면 무시하고 NORMAL로 되돌린다.
+// 그래서 온보드에서 posture+health를 합쳐 만든 4단계 값을 그대로 보내면 안 되고,
+// "건강 트랙만 반영한" 값으로 다시 계산해서 보내야 서버 로직과 의미가 맞는다.
 const char* healthOnlyLevelToStr(bool healthAbnormal) {
   return healthAbnormal ? "RECOMMEND" : "NORMAL";
 }
 
-// ═══════════════════════════════════════════════════════
-// raw값 전송 — AI 서버(RandomForest)가 이 값들로 윈도우 채워서 추락 판정.
-// 매 샘플(20ms)마다 호출. 모델이 ~50Hz 기준으로 학습돼서 너무 느리게 보내면
-// freefall/impact 구간이 윈도우에서 희석되어 판정이 안 됨.
-// 온디바이스 posture/health 판정 결과도 같이 실어서 서버에 전달한다.
-// ═══════════════════════════════════════════════════════
 void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz) {
   if (WiFi.status() != WL_CONNECTED) return;
 
@@ -294,7 +288,7 @@ void loop() {
 
   updateVitalsBuffer(latestGyroStd);
 
-  sendSensorData(ax, ay, az, gx, gy, gz);  // AI 서버로 raw값 + 온디바이스 판정 매 샘플 전송
+  sendSensorData(ax, ay, az, gx, gy, gz);
 
   bufAx[bufIndex] = ax; bufAy[bufIndex] = ay; bufAz[bufIndex] = az;
   bufGx[bufIndex] = gx; bufGy[bufIndex] = gy; bufGz[bufIndex] = gz;
