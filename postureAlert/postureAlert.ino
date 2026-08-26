@@ -23,6 +23,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include "maxSensor.h"
 
 // ── 핀 설정 ────────────────────────────────────────────────
 #define MPU_ADDR 0x68
@@ -47,7 +48,8 @@ const float THRESH_COLLAPSE_SLOPE     = 0.0f;    // deg/sample (실측 slope 중
 // ── WiFi / 서버 ────────────────────────────────────────────
 const char* ssid      = "TODO";  // 각자 환경에 맞게 채워서 사용 (커밋 금지)
 const char* password   = "TODO";
-const char* serverURL = "http://192.168.0.10:8080/api/safety-event";
+const char* serverURL = "http://:8080/api/safety-event";
+const char* sensorDataURL = "http://:8080/api/sensor-data";  // AI 서버 추락 판정용 raw값 전송
 const char* deviceId   = "HELMET-001";
 const char* ZONE_ID    = "TODO-ZONE";   // 비콘 파트 연동 전까지 임시값
 
@@ -66,6 +68,7 @@ void soundBuzzer(SafetyLevel level);
 const char* levelToStr(SafetyLevel level);
 const char* postureToStr(PostureStatus posture);
 void sendSafetyEvent(SafetyLevel level, PostureStatus posture, bool healthAbnormal);
+void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz);
 
 // ── 링버퍼 ─────────────────────────────────────────────────
 float bufAx[POSTURE_WINDOW_SIZE], bufAy[POSTURE_WINDOW_SIZE], bufAz[POSTURE_WINDOW_SIZE];
@@ -75,6 +78,12 @@ int bufCount = 0;
 
 unsigned long lastSampleMs = 0;
 SafetyLevel lastSentLevel = SafetyLevel::NORMAL;  // 같은 상태 반복 전송 방지
+float latestGyroStd = 0;
+
+// AI 서버 전송용 최신 판정값 (3초 윈도우 찰 때만 갱신, 그 전엔 기본값 유지)
+PostureStatus latestPosture = PostureStatus::STABLE;
+SafetyLevel latestLevel = SafetyLevel::NORMAL;
+bool latestHealthAbnormal = false;
 
 // ═══════════════════════════════════════════════════════
 // MPU6050 읽기
@@ -136,6 +145,7 @@ PostureStatus classifyPosture() {
     gyroSumSq += d * d;
   }
   float gyroStd = sqrtf(gyroSumSq / POSTURE_WINDOW_SIZE);
+  latestGyroStd = gyroStd;
 
   // 단순 선형회귀 기울기 (시간 t = 0..N-1)
   float n = POSTURE_WINDOW_SIZE;
@@ -159,8 +169,7 @@ PostureStatus classifyPosture() {
 // 건강 신호 이상 여부 (지원님 파트 연동 지점 — 지금은 더미)
 // ═══════════════════════════════════════════════════════
 bool checkHealthAbnormal() {
-  // TODO: 심박/온습도 판정 결과로 교체
-  return false;
+  return isVitalsAbnormal();
 }
 
 // ═══════════════════════════════════════════════════════
@@ -229,6 +238,36 @@ void sendSafetyEvent(SafetyLevel level, PostureStatus posture, bool healthAbnorm
 }
 
 // ═══════════════════════════════════════════════════════
+// raw값 전송 — AI 서버(RandomForest)가 이 값들로 윈도우 채워서 추락 판정
+// 매 샘플(20ms)마다 호출. 모델이 ~50Hz 기준으로 학습돼서 너무 느리게 보내면
+// freefall/impact 구간이 윈도우에서 희석되어 판정이 안 됨
+// ═══════════════════════════════════════════════════════
+void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin(sensorDataURL);
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<300> doc;
+  doc["deviceId"] = deviceId;
+  doc["ax"] = ax; doc["ay"] = ay; doc["az"] = az;
+  doc["gx"] = gx; doc["gy"] = gy; doc["gz"] = gz;
+  doc["heartRate"] = (int)lastBpm;
+  doc["spo2"] = (int)lastSpo2;
+  doc["posture"] = postureToStr(latestPosture);
+  doc["healthAbnormal"] = latestHealthAbnormal;
+  doc["level"] = levelToStr(latestLevel);
+
+  String body;
+  serializeJson(doc, body);
+
+  int code = http.POST(body);
+  Serial.printf("[raw 전송] 응답코드 %d\n", code);
+  http.end();
+}
+
+// ═══════════════════════════════════════════════════════
 // setup / loop
 // ═══════════════════════════════════════════════════════
 void setup() {
@@ -243,6 +282,9 @@ void setup() {
   Wire.write(0);
   Wire.endTransmission();
   Serial.println("MPU6050 초기화 완료");
+
+  delay(200);  // MAX30102 안정화 대기
+  initMaxSensor();
 
   WiFi.begin(ssid, password);
   Serial.print("Wi-Fi 연결 중");
@@ -263,6 +305,10 @@ void loop() {
   float ax, ay, az, gx, gy, gz;
   readMpu(ax, ay, az, gx, gy, gz);
 
+  updateVitalsBuffer(latestGyroStd);
+
+  sendSensorData(ax, ay, az, gx, gy, gz);  // AI 서버로 raw값 매 샘플 전송
+
   bufAx[bufIndex] = ax; bufAy[bufIndex] = ay; bufAz[bufIndex] = az;
   bufGx[bufIndex] = gx; bufGy[bufIndex] = gy; bufGz[bufIndex] = gz;
   bufIndex = (bufIndex + 1) % POSTURE_WINDOW_SIZE;
@@ -273,6 +319,10 @@ void loop() {
   PostureStatus posture = classifyPosture();
   bool healthAbnormal = checkHealthAbnormal();
   SafetyLevel level = determineSafetyLevel(posture, healthAbnormal);
+
+  latestPosture = posture;
+  latestHealthAbnormal = healthAbnormal;
+  latestLevel = level;
 
   // 설계 원칙 1: 불안정 감지되면 네트워크 상관없이 즉시 버저
   if (level != SafetyLevel::NORMAL) {
