@@ -32,7 +32,7 @@ const float BPM_MAX_NORMAL   = 140.0f;
 const float SPO2_MIN_NORMAL  = 92.0f;
 
 // ── 미착용/신호없음 판정 임계값 ────────────────────────────
-const long IR_FINGER_THRESHOLD = 50000;  // 이 값보다 낮으면 피부 미접촉으로 간주
+const long IR_FINGER_THRESHOLD = 15000;  // 이 값보다 낮으면 피부 미접촉으로 간주
 
 // ── motion artifact 배제 임계값 ────────────────────────────
 // PPG는 쉽게 깨지므로 더 보수적으로 잡음. 실착용 테스트하면서 조정 필요
