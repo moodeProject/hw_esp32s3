@@ -55,8 +55,8 @@ const float THRESH_COLLAPSE_TILT_DEG  = 40.0f;
 const float THRESH_COLLAPSE_SLOPE     = 0.0f;    // deg/sample (실측 slope 중앙값이 거의 0이라 완화)
 
 // ── WiFi / 서버 ────────────────────────────────────────────
-const char* ssid      = "ZW";  // 각자 환경에 맞게 채워서 사용 (커밋 금지)
-const char* password   = "20030716";
+const char* ssid      = "TODO";  // 각자 환경에 맞게 채워서 사용 (커밋 금지)
+const char* password   = "TODO";
 // 실제 배포된 서버 주소 + 엔드포인트. 서버(Spring)의 SensorDataController가
 // "/api/sensor-data"로 열려있고, raw IMU(ax~gz)를 필수로 요구한다.
 // TODO: 백엔드가 "/api/v1" 프리픽스를 실제로 붙이면 "/api/v1/sensor-data"로 변경.
