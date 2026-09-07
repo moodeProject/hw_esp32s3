@@ -46,14 +46,14 @@ const float THRESH_COLLAPSE_TILT_DEG  = 40.0f;
 const float THRESH_COLLAPSE_SLOPE     = 0.0f;    // deg/sample (실측 slope 중앙값이 거의 0이라 완화)
 
 // ── WiFi / 서버 ────────────────────────────────────────────
-const char* ssid      = "TODO";  // 각자 환경에 맞게 채워서 사용 (커밋 금지)
-const char* password   = "TODO";
+const char* ssid      = "ZW";  // 각자 환경에 맞게 채워서 사용 (커밋 금지)
+const char* password   = "20030716";
 // 실제 배포된 서버 주소 + 엔드포인트. 서버(Spring)의 SensorDataController가
 // "/api/sensor-data"로 열려있고, raw IMU(ax~gz)를 필수로 요구한다.
 // TODO: 백엔드가 "/api/v1" 프리픽스를 실제로 붙이면 "/api/v1/sensor-data"로 변경.
 // 현재는 백엔드에 프리픽스가 없어서(미반영 확인됨) /v1을 붙이면 404가 나므로
 // 지금 배포된 서버에 맞춰 프리픽스 없이 둔다.
-const char* sensorDataURL = "http://:8080/api/sensor-data";
+const char* sensorDataURL = "http://10.190.44.214:8080/api/sensor-data";
 const char* deviceId   = "HELMET-001";
 // zoneId는 서버 SensorDataRequest DTO에 아직 필드가 없어서(비콘 브랜치 미반영)
 // 지금은 보내지 않는다. 필드 추가되면 다시 포함.
@@ -83,6 +83,14 @@ int bufCount = 0;
 
 unsigned long lastSampleMs = 0;
 float latestGyroStd = 0;
+
+// ── 서버 전송 주기 (센서 샘플링과 분리) ──────────────────────
+// [루프 타이밍 수정] 기존엔 매 루프마다 sendSensorData()를 호출해서
+// HTTP 응답을 기다리는 동안 센서 샘플링(updateVitalsBuffer/자세 버퍼)까지
+// 같이 멈춰버려 250개/150개 윈도우가 채워지는 데 원래 의도보다 훨씬
+// 오래 걸리는 문제가 있었음. 전송만 별도 주기로 분리.
+#define SEND_INTERVAL_MS 200
+unsigned long lastSendMs = 0;
 
 PostureStatus latestPosture = PostureStatus::STABLE;
 bool latestHealthAbnormal = false;
@@ -230,7 +238,7 @@ void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz) 
   http.begin(sensorDataURL);
   http.addHeader("Content-Type", "application/json");
 
-  StaticJsonDocument<300> doc;
+  StaticJsonDocument<400> doc;
   doc["deviceId"] = deviceId;
   doc["ax"] = ax; doc["ay"] = ay; doc["az"] = az;
   doc["gx"] = gx; doc["gy"] = gy; doc["gz"] = gz;
@@ -239,6 +247,10 @@ void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz) 
   doc["posture"] = postureToStr(latestPosture);
   doc["healthAbnormal"] = latestHealthAbnormal;
   doc["level"] = healthOnlyLevelToStr(latestHealthAbnormal);
+  // 지원님 파트: 원인별 값 (서버에 원인 구분해서 저장/노출하기 위함)
+  doc["hrv"] = getLastHrv();
+  doc["fatigueAbnormal"] = isFatigueAbnormal();
+  doc["heatRiskAbnormal"] = isHeatRiskAbnormal();
 
   String body;
   serializeJson(doc, body);
@@ -288,7 +300,10 @@ void loop() {
 
   updateVitalsBuffer(latestGyroStd);
 
-  sendSensorData(ax, ay, az, gx, gy, gz);
+  if (now - lastSendMs >= SEND_INTERVAL_MS) {
+    lastSendMs = now;
+    sendSensorData(ax, ay, az, gx, gy, gz);
+  }
 
   bufAx[bufIndex] = ax; bufAy[bufIndex] = ay; bufAz[bufIndex] = az;
   bufGx[bufIndex] = gx; bufGy[bufIndex] = gy; bufGz[bufIndex] = gz;
