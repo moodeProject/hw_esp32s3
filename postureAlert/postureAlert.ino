@@ -75,6 +75,8 @@ const uint8_t TARGET_UUID[16] = {
   0xFD, 0xA5, 0x06, 0x93, 0xA4, 0xE2, 0x4F, 0xB1,
   0xAF, 0xCF, 0xC6, 0xEB, 0x07, 0x64, 0x78, 0x25
 };
+// 실측 확인된 배포 비콘의 제조사 ID (little-endian 그대로, MFG 데이터 앞 2바이트).
+const uint8_t TARGET_COMPANY_ID[2] = {0xFF, 0xFF};
 #define BEACON_SCAN_TIME_SEC 3
 #define BEACON_STALE_MS 8000   // 이 시간 동안 새 스캔 결과가 없으면 "구역 없음" 취급
 
@@ -86,6 +88,11 @@ unsigned long currentZoneUpdatedMs = 0;
 uint16_t loggedZoneMajor = 0;
 bool loggedZoneValid = false;
 
+/**
+ * 비콘 major 값을 사람이 읽는 구역 이름으로 변환한다.
+ * @param major iBeacon major 값.
+ * @return 매핑된 구역 이름, 모르는 major면 "UNKNOWN".
+ */
 const char* zoneNameForMajor(uint16_t major) {
   switch (major) {
     case 34336: return "ZONE-01";  // 테스트 위치 기준 확인됨
@@ -288,6 +295,10 @@ void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz) 
 // ═══════════════════════════════════════════════════════
 // setup / loop
 // ═══════════════════════════════════════════════════════
+/**
+ * 센서(MPU6050, MAX30102), WiFi, 비콘 스캔 태스크를 초기화한다.
+ * 뮤텍스/태스크 생성에 실패하면 비콘 구역 판정만 비활성화하고 나머지는 계속 진행한다.
+ */
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -364,8 +375,16 @@ void loop() {
 // ═══════════════════════════════════════════════════════
 // 비콘 구역 판정 (core 0에서 별도 태스크로 계속 스캔)
 // ═══════════════════════════════════════════════════════
+/**
+ * BLE 광고의 제조사 데이터가 우리 비콘(iBeacon) 프레임인지 검증하고 major를 파싱한다.
+ * @param mfg 제조사 데이터 raw 바이트.
+ * @param len mfg의 길이(바이트).
+ * @param major [out] 파싱된 major 값 (유효할 때만 채워짐).
+ * @return type/length/UUID가 전부 일치하면 true.
+ */
 bool parseIBeacon(const uint8_t* mfg, size_t len, uint16_t &major) {
   if (len < 25) return false;
+  if (mfg[0] != TARGET_COMPANY_ID[0] || mfg[1] != TARGET_COMPANY_ID[1]) return false;
   if (mfg[2] != 0x02 || mfg[3] != 0x15) return false;
   for (int i = 0; i < 16; i++) {
     if (mfg[4 + i] != TARGET_UUID[i]) return false;
@@ -374,7 +393,12 @@ bool parseIBeacon(const uint8_t* mfg, size_t len, uint16_t &major) {
   return true;
 }
 
+/** BLE 스캔 중 광고가 잡힐 때마다 호출되는 콜백. 구역 후보 갱신을 담당한다. */
 class BeaconScanCallback : public BLEAdvertisedDeviceCallbacks {
+  /**
+   * 잡힌 광고가 우리 비콘이고 매핑된(known) major면, 지금까지 이번 라운드에서
+   * 본 것 중 RSSI가 가장 세면 currentZoneMajor/currentZoneValid를 갱신한다.
+   */
   void onResult(BLEAdvertisedDevice advertisedDevice) override {
     if (!advertisedDevice.haveManufacturerData()) return;
     String md = advertisedDevice.getManufacturerData();
@@ -403,6 +427,12 @@ class BeaconScanCallback : public BLEAdvertisedDeviceCallbacks {
   int lastBestRssi = -1000;
 };
 
+/**
+ * core 0에서 도는 FreeRTOS 태스크. 3초씩 BLE 스캔을 반복하면서 currentZoneMajor를
+ * 갱신하고, 오래(BEACON_STALE_MS) 갱신이 없으면 "구역 없음"으로 되돌린다.
+ * 구역이 실제로 바뀌거나 만료될 때만 시리얼 로그를 남긴다.
+ * @param param FreeRTOS 태스크 파라미터 (사용 안 함).
+ */
 void bleTask(void* param) {
   BLEDevice::init("");
   BLEScan* pBLEScan = BLEDevice::getScan();

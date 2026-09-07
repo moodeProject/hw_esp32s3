@@ -34,6 +34,16 @@ bool foundAny;
 BeaconReading currentBest;    // 라운드 간 유지되는, hysteresis 적용된 현재 구역
 bool haveCurrentBest = false;
 
+/**
+ * BLE 광고 패킷의 제조사 데이터(mfg)가 우리 비콘의 iBeacon 프레임인지 검증하고,
+ * 맞다면 major/minor를 파싱해서 출력 인자로 채운다.
+ *
+ * @param mfg 제조사 데이터 raw 바이트 (BLEAdvertisedDevice::getManufacturerData()).
+ * @param len mfg의 길이(바이트).
+ * @param major [out] 파싱된 major 값 (프레임이 유효할 때만 채워짐).
+ * @param minor [out] 파싱된 minor 값 (프레임이 유효할 때만 채워짐).
+ * @return companyId/type/length/UUID가 전부 우리 비콘과 일치하면 true, 아니면 false.
+ */
 bool parseIBeacon(const uint8_t* mfg, size_t len, uint16_t &major, uint16_t &minor) {
   // 최소 길이: companyId(2) + type(1) + len(1) + uuid(16) + major(2) + minor(2) + txPower(1) = 25
   if (len < 25) return false;
@@ -47,7 +57,12 @@ bool parseIBeacon(const uint8_t* mfg, size_t len, uint16_t &major, uint16_t &min
   return true;
 }
 
+/** BLE 스캔 중 광고가 잡힐 때마다 호출되는 콜백. */
 class ScanCallback : public BLEAdvertisedDeviceCallbacks {
+  /**
+   * 잡힌 광고가 우리 비콘이면 major/minor/RSSI를 로그로 출력하고,
+   * 이번 스캔 라운드 내에서 지금까지 본 것 중 RSSI가 가장 센 비콘을 roundBest에 기록한다.
+   */
   void onResult(BLEAdvertisedDevice advertisedDevice) override {
     if (!advertisedDevice.haveManufacturerData()) return;
 
@@ -67,6 +82,7 @@ class ScanCallback : public BLEAdvertisedDeviceCallbacks {
   }
 };
 
+/** 시리얼/BLE 스캐너를 초기화한다. */
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -80,6 +96,10 @@ void setup() {
   pBLEScan->setWindow(99);
 }
 
+/**
+ * SCAN_TIME_SEC초짜리 BLE 스캔을 한 라운드 돌리고, hysteresis를 적용해서
+ * currentBest(현재 구역 추정)를 갱신한 뒤 결과를 시리얼로 출력한다.
+ */
 void loop() {
   foundAny = false;
   Serial.println("--- 스캔 라운드 ---");
