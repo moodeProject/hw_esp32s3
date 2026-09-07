@@ -21,8 +21,8 @@
 // 같은 loop()에서 돌리면 타이밍이 깨진다. 그래서 core 0에 별도 FreeRTOS
 // 태스크로 분리해서 계속 스캔하게 하고, IMU/자세 판정은 원래대로 core 1의
 // 기본 loop()에서 그대로 돈다. 둘 사이는 currentZone 전역 변수(뮤텍스로 보호)로
-// 공유한다. 서버 SensorDataRequest DTO에 zoneId 필드가 아직 없어서, 지금은
-// 서버로는 안 보내고 로컬 로그로만 확인한다.
+// 공유한다. 서버 SensorDataRequest DTO에 zoneId 필드가 추가되어(server:
+// feat/zone-id-sensor-data) sendSensorData()에서 실제로 같이 전송한다.
 // ─────────────────────────────────────────────────────────
 
 #include <Wire.h>
@@ -64,8 +64,7 @@ const char* password   = "TODO";
 // 지금 배포된 서버에 맞춰 프리픽스 없이 둔다.
 const char* sensorDataURL = "http://13.209.96.183:8080/api/sensor-data";
 const char* deviceId   = "HELMET-001";
-// zoneId는 서버 SensorDataRequest DTO에 아직 필드가 없어서 지금은 JSON엔 안 넣고
-// Serial 로그로만 확인한다. 필드 추가되면 sendSensorData()에 포함시키면 됨.
+// zoneId는 sendSensorData()에서 currentZone 상태를 읽어 함께 전송한다.
 
 // ── 비콘 / 구역 ────────────────────────────────────────────
 // Holy-IOT 비콘 공통 UUID (FDA50693-A4E2-4FB1-AFCF-C6EB07647825), major로 구역 구분.
@@ -283,6 +282,22 @@ void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz) 
   doc["posture"] = postureToStr(latestPosture);
   doc["healthAbnormal"] = latestHealthAbnormal;
   doc["level"] = healthOnlyLevelToStr(latestHealthAbnormal);
+
+  // 서버 SensorDataRequest에 zoneId 필드가 추가되어(server PR: feat/zone-id-sensor-data)
+  // 이제 실제로 같이 보낸다. 유효한 구역이 없으면 zoneId 필드 자체를 넣지 않는다
+  // (null로 명시하는 게 아니라 키 자체가 JSON에서 생략됨).
+  // zoneMutex는 비콘 태스크 초기화 실패 시 NULL일 수 있으므로(setup() 참고) 먼저 확인한다.
+  bool zoneValid = false;
+  uint16_t zoneMajor = 0;
+  if (zoneMutex != NULL) {
+    xSemaphoreTake(zoneMutex, portMAX_DELAY);
+    zoneValid = currentZoneValid;
+    zoneMajor = currentZoneMajor;
+    xSemaphoreGive(zoneMutex);
+  }
+  if (zoneValid) {
+    doc["zoneId"] = zoneNameForMajor(zoneMajor);
+  }
 
   String body;
   serializeJson(doc, body);
