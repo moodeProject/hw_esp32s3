@@ -78,10 +78,13 @@ const uint8_t TARGET_UUID[16] = {
 #define BEACON_SCAN_TIME_SEC 3
 #define BEACON_STALE_MS 8000   // 이 시간 동안 새 스캔 결과가 없으면 "구역 없음" 취급
 
-SemaphoreHandle_t zoneMutex;
+SemaphoreHandle_t zoneMutex = NULL;
 uint16_t currentZoneMajor = 0;
 bool currentZoneValid = false;
 unsigned long currentZoneUpdatedMs = 0;
+// bleTask()에서 "구역이 실제로 바뀌었을 때만" 로그를 남기기 위한 이전 상태 기록.
+uint16_t loggedZoneMajor = 0;
+bool loggedZoneValid = false;
 
 const char* zoneNameForMajor(uint16_t major) {
   switch (major) {
@@ -312,8 +315,18 @@ void setup() {
   Serial.println(WiFi.status() == WL_CONNECTED ? "\nWi-Fi 연결 완료" : "\nWi-Fi 실패 (계속 진행, 버저는 동작함)");
 
   zoneMutex = xSemaphoreCreateMutex();
-  xTaskCreatePinnedToCore(bleTask, "BeaconScan", 4096, NULL, 1, NULL, 0);
-  Serial.println("비콘 스캔 태스크 시작 (core 0)");
+  if (zoneMutex == NULL) {
+    Serial.println("[비콘] 뮤텍스 생성 실패 — 비콘 구역 판정 비활성화");
+  } else {
+    BaseType_t taskCreated = xTaskCreatePinnedToCore(bleTask, "BeaconScan", 4096, NULL, 1, NULL, 0);
+    if (taskCreated != pdPASS) {
+      Serial.println("[비콘] 스캔 태스크 생성 실패 — 비콘 구역 판정 비활성화");
+      vSemaphoreDelete(zoneMutex);
+      zoneMutex = NULL;
+    } else {
+      Serial.println("비콘 스캔 태스크 시작 (core 0)");
+    }
+  }
 }
 
 void loop() {
@@ -369,6 +382,9 @@ class BeaconScanCallback : public BLEAdvertisedDeviceCallbacks {
 
     uint16_t major;
     if (!parseIBeacon((const uint8_t*)md.c_str(), md.length(), major)) return;
+    // 매핑 안 된 major(새 비콘이 추가됐는데 코드가 아직 안 따라온 경우 등)는
+    // 후보에서 제외 — 신호가 세더라도 이름 모르는 구역으로 갈아타지 않는다.
+    if (strcmp(zoneNameForMajor(major), "UNKNOWN") == 0) return;
 
     int rssi = advertisedDevice.getRSSI();
 
@@ -406,7 +422,20 @@ void bleTask(void* param) {
     if (currentZoneValid && millis() - currentZoneUpdatedMs > BEACON_STALE_MS) {
       currentZoneValid = false;
     }
+    uint16_t zoneMajorCopy = currentZoneMajor;
+    bool zoneValidCopy = currentZoneValid;
     xSemaphoreGive(zoneMutex);
+
+    // 구역이 바뀌었거나(다른 major) 유효/만료 상태가 바뀌었을 때만 로그.
+    if (zoneValidCopy != loggedZoneValid || zoneMajorCopy != loggedZoneMajor) {
+      if (zoneValidCopy) {
+        Serial.printf("[구역] %s (major=%u)\n", zoneNameForMajor(zoneMajorCopy), zoneMajorCopy);
+      } else {
+        Serial.println("[구역] 없음 (비콘 범위 밖)");
+      }
+      loggedZoneMajor = zoneMajorCopy;
+      loggedZoneValid = zoneValidCopy;
+    }
 
     vTaskDelay(pdMS_TO_TICKS(300));
   }
