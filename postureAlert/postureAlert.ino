@@ -284,11 +284,17 @@ void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz) 
   doc["level"] = healthOnlyLevelToStr(latestHealthAbnormal);
 
   // 서버 SensorDataRequest에 zoneId 필드가 추가되어(server PR: feat/zone-id-sensor-data)
-  // 이제 실제로 같이 보낸다. 유효한 구역이 없으면 null로 보내서 서버가 미수신으로 인지하게 한다.
-  xSemaphoreTake(zoneMutex, portMAX_DELAY);
-  bool zoneValid = currentZoneValid;
-  uint16_t zoneMajor = currentZoneMajor;
-  xSemaphoreGive(zoneMutex);
+  // 이제 실제로 같이 보낸다. 유효한 구역이 없으면 zoneId 필드 자체를 넣지 않는다
+  // (null로 명시하는 게 아니라 키 자체가 JSON에서 생략됨).
+  // zoneMutex는 비콘 태스크 초기화 실패 시 NULL일 수 있으므로(setup() 참고) 먼저 확인한다.
+  bool zoneValid = false;
+  uint16_t zoneMajor = 0;
+  if (zoneMutex != NULL) {
+    xSemaphoreTake(zoneMutex, portMAX_DELAY);
+    zoneValid = currentZoneValid;
+    zoneMajor = currentZoneMajor;
+    xSemaphoreGive(zoneMutex);
+  }
   if (zoneValid) {
     doc["zoneId"] = zoneNameForMajor(zoneMajor);
   }
