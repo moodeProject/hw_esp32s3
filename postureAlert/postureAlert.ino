@@ -15,8 +15,14 @@
 //   둘 다 아님                        -> NORMAL
 //
 // TODO(지원님 파트 연동 지점): checkHealthAbnormal() 안의 더미를
-// 실제 심박/온습도 판정 결과로 교체
-// TODO(비콘 파트 연동 지점): ZONE_ID를 비콘 RSSI 스캔 결과로 교체
+// 실제 심박/온습도 판정 결과로 교체 -> 완료 (isVitalsAbnormal())
+//
+// 비콘 구역 판정: BLE 스캔은 초 단위로 블로킹되기 때문에 50Hz IMU 샘플링과
+// 같은 loop()에서 돌리면 타이밍이 깨진다. 그래서 core 0에 별도 FreeRTOS
+// 태스크로 분리해서 계속 스캔하게 하고, IMU/자세 판정은 원래대로 core 1의
+// 기본 loop()에서 그대로 돈다. 둘 사이는 currentZone 전역 변수(뮤텍스로 보호)로
+// 공유한다. 서버 SensorDataRequest DTO에 zoneId 필드가 아직 없어서, 지금은
+// 서버로는 안 보내고 로컬 로그로만 확인한다.
 // ─────────────────────────────────────────────────────────
 
 #include <Wire.h>
@@ -24,6 +30,9 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include "maxSensor.h"
+#include <BLEDevice.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
 
 // ── 핀 설정 ────────────────────────────────────────────────
 #define MPU_ADDR 0x68
@@ -53,10 +62,34 @@ const char* password   = "TODO";
 // TODO: 백엔드가 "/api/v1" 프리픽스를 실제로 붙이면 "/api/v1/sensor-data"로 변경.
 // 현재는 백엔드에 프리픽스가 없어서(미반영 확인됨) /v1을 붙이면 404가 나므로
 // 지금 배포된 서버에 맞춰 프리픽스 없이 둔다.
-const char* sensorDataURL = "http://:8080/api/sensor-data";
+const char* sensorDataURL = "http://13.209.96.183:8080/api/sensor-data";
 const char* deviceId   = "HELMET-001";
-// zoneId는 서버 SensorDataRequest DTO에 아직 필드가 없어서(비콘 브랜치 미반영)
-// 지금은 보내지 않는다. 필드 추가되면 다시 포함.
+// zoneId는 서버 SensorDataRequest DTO에 아직 필드가 없어서 지금은 JSON엔 안 넣고
+// Serial 로그로만 확인한다. 필드 추가되면 sendSensorData()에 포함시키면 됨.
+
+// ── 비콘 / 구역 ────────────────────────────────────────────
+// Holy-IOT 비콘 공통 UUID (FDA50693-A4E2-4FB1-AFCF-C6EB07647825), major로 구역 구분.
+// major 34336/34435는 실측으로 확인된 값(테스트 위치 기준) — 실제 현장 배치되면
+// zoneNameForMajor()의 매핑을 그 구역 이름으로 다시 채워야 한다.
+const uint8_t TARGET_UUID[16] = {
+  0xFD, 0xA5, 0x06, 0x93, 0xA4, 0xE2, 0x4F, 0xB1,
+  0xAF, 0xCF, 0xC6, 0xEB, 0x07, 0x64, 0x78, 0x25
+};
+#define BEACON_SCAN_TIME_SEC 3
+#define BEACON_STALE_MS 8000   // 이 시간 동안 새 스캔 결과가 없으면 "구역 없음" 취급
+
+SemaphoreHandle_t zoneMutex;
+uint16_t currentZoneMajor = 0;
+bool currentZoneValid = false;
+unsigned long currentZoneUpdatedMs = 0;
+
+const char* zoneNameForMajor(uint16_t major) {
+  switch (major) {
+    case 34336: return "ZONE-01";  // 테스트 위치 기준 확인됨
+    case 34435: return "ZONE-02";
+    default:    return "UNKNOWN";
+  }
+}
 
 // ── 상태 enum ──────────────────────────────────────────────
 enum class PostureStatus { STABLE, STUMBLE, COLLAPSE };
@@ -74,6 +107,7 @@ const char* levelToStr(SafetyLevel level);
 const char* postureToStr(PostureStatus posture);
 const char* healthOnlyLevelToStr(bool healthAbnormal);
 void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz);
+void bleTask(void* param);
 
 // ── 링버퍼 ─────────────────────────────────────────────────
 float bufAx[POSTURE_WINDOW_SIZE], bufAy[POSTURE_WINDOW_SIZE], bufAz[POSTURE_WINDOW_SIZE];
@@ -276,6 +310,10 @@ void setup() {
     retry++;
   }
   Serial.println(WiFi.status() == WL_CONNECTED ? "\nWi-Fi 연결 완료" : "\nWi-Fi 실패 (계속 진행, 버저는 동작함)");
+
+  zoneMutex = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(bleTask, "BeaconScan", 4096, NULL, 1, NULL, 0);
+  Serial.println("비콘 스캔 태스크 시작 (core 0)");
 }
 
 void loop() {
@@ -307,5 +345,69 @@ void loop() {
   // 설계 원칙 1: 불안정 감지되면 네트워크 상관없이 즉시 버저
   if (level != SafetyLevel::NORMAL) {
     soundBuzzer(level);
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// 비콘 구역 판정 (core 0에서 별도 태스크로 계속 스캔)
+// ═══════════════════════════════════════════════════════
+bool parseIBeacon(const uint8_t* mfg, size_t len, uint16_t &major) {
+  if (len < 25) return false;
+  if (mfg[2] != 0x02 || mfg[3] != 0x15) return false;
+  for (int i = 0; i < 16; i++) {
+    if (mfg[4 + i] != TARGET_UUID[i]) return false;
+  }
+  major = (mfg[20] << 8) | mfg[21];
+  return true;
+}
+
+class BeaconScanCallback : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) override {
+    if (!advertisedDevice.haveManufacturerData()) return;
+    String md = advertisedDevice.getManufacturerData();
+    if (md.length() < 25) return;
+
+    uint16_t major;
+    if (!parseIBeacon((const uint8_t*)md.c_str(), md.length(), major)) return;
+
+    int rssi = advertisedDevice.getRSSI();
+
+    xSemaphoreTake(zoneMutex, portMAX_DELAY);
+    bool shouldUpdate = !currentZoneValid || rssi > lastBestRssi;
+    if (shouldUpdate) {
+      currentZoneMajor = major;
+      lastBestRssi = rssi;
+      currentZoneValid = true;
+      currentZoneUpdatedMs = millis();
+    }
+    xSemaphoreGive(zoneMutex);
+  }
+
+ public:
+  int lastBestRssi = -1000;
+};
+
+void bleTask(void* param) {
+  BLEDevice::init("");
+  BLEScan* pBLEScan = BLEDevice::getScan();
+  BeaconScanCallback* cb = new BeaconScanCallback();
+  pBLEScan->setAdvertisedDeviceCallbacks(cb, true);
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
+
+  for (;;) {
+    cb->lastBestRssi = -1000;
+    pBLEScan->start(BEACON_SCAN_TIME_SEC, false);
+    pBLEScan->clearResults();
+
+    // 너무 오래 갱신이 없으면(비콘 범위 밖) "구역 없음" 처리
+    xSemaphoreTake(zoneMutex, portMAX_DELAY);
+    if (currentZoneValid && millis() - currentZoneUpdatedMs > BEACON_STALE_MS) {
+      currentZoneValid = false;
+    }
+    xSemaphoreGive(zoneMutex);
+
+    vTaskDelay(pdMS_TO_TICKS(300));
   }
 }
