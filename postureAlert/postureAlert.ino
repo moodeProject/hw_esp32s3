@@ -30,6 +30,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include "maxSensor.h"
+#include "fallDetector.h"   // 온보드 낙상 감지 (FastAPI /predict 이식)
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
@@ -138,6 +139,13 @@ unsigned long lastSendMs = 0;
 PostureStatus latestPosture = PostureStatus::STABLE;
 bool latestHealthAbnormal = false;
 
+// ── 온보드 낙상 감지 결과 ───────────────────────────────────
+// 판정은 20ms마다, 정기 전송은 200ms마다라서 그 사이에 잡힌 낙상을 놓치지 않도록
+// "전송 전까지 한 번이라도 감지됐는지 / 최고 confidence"를 붙잡아 둔다.
+// 낙상이 처음 잡힌 순간에는 정기 전송을 기다리지 않고 즉시 전송한다 (loop() 참고).
+bool pendingFallDetected = false;
+float pendingFallConfidence = 0.0f;
+
 // ═══════════════════════════════════════════════════════
 // MPU6050 읽기
 // ═══════════════════════════════════════════════════════
@@ -155,12 +163,12 @@ void readMpu(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
   int16_t gyRaw = Wire.read() << 8 | Wire.read();
   int16_t gzRaw = Wire.read() << 8 | Wire.read();
 
-  ax = axRaw / 16384.0f * 9.8f;  // g -> m/s^2 (postureAlertLogic.py와 스케일 맞춤)
-  ay = ayRaw / 16384.0f * 9.8f;
-  az = azRaw / 16384.0f * 9.8f;
-  gx = gxRaw / 131.0f;
-  gy = gyRaw / 131.0f;
-  gz = gzRaw / 131.0f;
+  ax = axRaw / 2048.0f * 9.8f;  // g -> m/s^2 (±16g 기준: 2048 = 1g)
+  ay = ayRaw / 2048.0f * 9.8f;
+  az = azRaw / 2048.0f * 9.8f;
+  gx = gxRaw / 16.4f;           // deg/s (±2000°/s 기준: 16.4 = 1°/s)
+  gy = gyRaw / 16.4f;
+  gz = gzRaw / 16.4f;
 }
 
 // ═══════════════════════════════════════════════════════
@@ -281,7 +289,7 @@ void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz) 
   http.begin(sensorDataURL);
   http.addHeader("Content-Type", "application/json");
 
-  StaticJsonDocument<400> doc;
+  StaticJsonDocument<512> doc;   // 400 -> 512 (fallDetected/fallConfidence 추가로 여유 확보)
   doc["deviceId"] = deviceId;
   doc["ax"] = ax; doc["ay"] = ay; doc["az"] = az;
   doc["gx"] = gx; doc["gy"] = gy; doc["gz"] = gz;
@@ -294,6 +302,9 @@ void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz) 
   doc["hrv"] = getLastHrv();
   doc["fatigueAbnormal"] = isFatigueAbnormal();
   doc["heatRiskAbnormal"] = isHeatRiskAbnormal();
+  // 온보드 낙상 판정 결과 (기존 FastAPI /predict 응답의 fallDetected / confidence 자리)
+  doc["fallDetected"] = pendingFallDetected;
+  doc["fallConfidence"] = pendingFallConfidence;
 
   // 서버 SensorDataRequest에 zoneId 필드가 추가되어(server PR: feat/zone-id-sensor-data)
   // 이제 실제로 같이 보낸다. 유효한 구역이 없으면 zoneId 필드 자체를 넣지 않는다
@@ -316,6 +327,10 @@ void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz) 
 
   int code = http.POST(body);
   Serial.printf("[raw 전송] 응답코드 %d\n", code);
+  if (code > 0) {   // 전송 성공했을 때만 초기화 (실패하면 다음 전송 때 다시 보냄)
+    pendingFallDetected = false;
+    pendingFallConfidence = 0.0f;
+  }
   http.end();
 }
 
@@ -336,6 +351,16 @@ void setup() {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x6B);
   Wire.write(0);
+  Wire.endTransmission();
+
+  // 측정 범위 확대 — 기본값(±2g/±250°/s)은 낙상 충격·회전이 잘려서 판정이 약해짐
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1C);   // 가속도 범위 설정 레지스터
+  Wire.write(0x18);   // ±16g
+  Wire.endTransmission();
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1B);   // 자이로 범위 설정 레지스터
+  Wire.write(0x18);   // ±2000°/s
   Wire.endTransmission();
   Serial.println("MPU6050 초기화 완료");
 
@@ -387,11 +412,38 @@ void loop() {
   bufIndex = (bufIndex + 1) % POSTURE_WINDOW_SIZE;
   if (bufCount < POSTURE_WINDOW_SIZE) bufCount++;
 
+  // ── 온보드 낙상 판정 (FastAPI /predict와 동일: 최근 50개 윈도우) ──
+  // 자세 판정(150개)보다 먼저 돌려야 버퍼 50개만 차도 바로 판정 가능
+  if (bufCount >= FALL_WINDOW_SIZE) {
+    static float fallWindow[FALL_WINDOW_SIZE][6];
+    for (int i = 0; i < FALL_WINDOW_SIZE; i++) {
+      int idx = (bufIndex - FALL_WINDOW_SIZE + i + POSTURE_WINDOW_SIZE) % POSTURE_WINDOW_SIZE;
+      fallWindow[i][0] = bufAx[idx]; fallWindow[i][1] = bufAy[idx]; fallWindow[i][2] = bufAz[idx];
+      fallWindow[i][3] = bufGx[idx]; fallWindow[i][4] = bufGy[idx]; fallWindow[i][5] = bufGz[idx];
+    }
+    FallResult fall = predictFall(fallWindow);
+    if (fall.confidence > pendingFallConfidence) pendingFallConfidence = fall.confidence;
+    // prevFallDetected: 20ms 전 판정 결과. 정상 -> 낙상으로 "바뀐 순간"에만 즉시 전송해서
+    // 충격이 윈도우에 남아있는 ~1초 동안 전송이 20ms마다 반복되는 것을 막는다.
+    static bool prevFallDetected = false;
+    if (fall.fallDetected) {
+      pendingFallDetected = true;                  // 다음 정기 전송에도 낙상으로 실려감
+      if (!prevFallDetected) {
+        Serial.printf("[낙상 감지] confidence=%.2f\n", fall.confidence);
+        lastSendMs = now;                          // 정기 전송 타이머 리셋
+        sendSensorData(ax, ay, az, gx, gy, gz);    // 200ms 기다리지 않고 즉시 전송
+      }
+    }
+    prevFallDetected = fall.fallDetected;
+  }
+
   if (bufCount < POSTURE_WINDOW_SIZE) return;  // 윈도우 아직 안 참
 
   PostureStatus posture = classifyPosture();
   bool healthAbnormal = checkHealthAbnormal();
-  SafetyLevel level = determineSafetyLevel(posture, healthAbnormal);
+  // 자세 판정은 서버 전송(기록)만 하고 버저에는 반영하지 않는다 — 정상 동작에서도 오탐이 잦음.
+  // 버저는 건강 이상만으로 판단 (determineSafetyLevel에 STABLE을 넣으면 건강만 반영됨)
+  SafetyLevel level = determineSafetyLevel(PostureStatus::STABLE, healthAbnormal);
 
   latestPosture = posture;
   latestHealthAbnormal = healthAbnormal;
