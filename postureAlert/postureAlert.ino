@@ -400,7 +400,7 @@ void loop() {
   float ax, ay, az, gx, gy, gz;
   readMpu(ax, ay, az, gx, gy, gz);
 
-  updateVitalsBuffer(latestGyroStd);
+  updateVitalsBuffer(latestGyroStd);  // MAX30102 활성화/비활성화
 
   if (now - lastSendMs >= SEND_INTERVAL_MS) {
     lastSendMs = now;
@@ -422,6 +422,16 @@ void loop() {
       fallWindow[i][3] = bufGx[idx]; fallWindow[i][4] = bufGy[idx]; fallWindow[i][5] = bufGz[idx];
     }
     FallResult fall = predictFall(fallWindow);
+
+        // [임시 디버그] 1초마다 판정 횟수와 최고 confidence 출력 - 테스트 후 삭제
+    static float dbgMax = 0; static int dbgCnt = 0; static unsigned long dbgMs = 0;
+    if (fall.confidence > dbgMax) dbgMax = fall.confidence;
+    dbgCnt++;
+    if (now - dbgMs >= 1000) {
+      Serial.printf("[디버그] 1초간 판정 %d회, 최고 conf=%.2f\n", dbgCnt, dbgMax);
+      dbgMax = 0; dbgCnt = 0; dbgMs = now;
+    }
+
     if (fall.confidence > pendingFallConfidence) pendingFallConfidence = fall.confidence;
     // prevFallDetected: 20ms 전 판정 결과. 정상 -> 낙상으로 "바뀐 순간"에만 즉시 전송해서
     // 충격이 윈도우에 남아있는 ~1초 동안 전송이 20ms마다 반복되는 것을 막는다.
