@@ -282,12 +282,40 @@ const char* healthOnlyLevelToStr(bool healthAbnormal) {
   return healthAbnormal ? "RECOMMEND" : "NORMAL";
 }
 
-void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz) {
-  if (WiFi.status() != WL_CONNECTED) return;
+// ── 서버 전송 전용 태스크 (loop가 HTTP 응답을 기다리느라 멈추지 않게) ──
+// loop(판정)는 보낼 내용을 "우편함(sendQueue)"에 넣기만 하고 바로 다음 판정으로 넘어가고,
+// 실제 HTTP 전송과 응답 대기는 core 0에서 따로 도는 sendTask가 맡는다.
+struct SendMsg {
+  char body[512];   // 서버로 보낼 JSON 문자열
+  bool hadFall;     // 이 메시지에 낙상=true가 실렸는지
+};
+QueueHandle_t sendQueue = NULL;        // 한 칸짜리 우편함 (안 나간 메시지는 최신 것으로 덮어씀)
+volatile bool fallDelivered = false;   // 낙상이 실린 메시지를 서버가 받았으면 true
 
+void sendTask(void* param) {
+  SendMsg msg;
   HTTPClient http;
-  http.begin(sensorDataURL);
-  http.addHeader("Content-Type", "application/json");
+  for (;;) {
+    if (xQueueReceive(sendQueue, &msg, portMAX_DELAY) != pdTRUE) continue;
+    if (WiFi.status() != WL_CONNECTED) continue;
+    http.begin(sensorDataURL);
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST((uint8_t*)msg.body, strlen(msg.body));
+    Serial.printf("[raw 전송] 응답코드 %d\n", code);
+    if (code > 0 && msg.hadFall) fallDelivered = true;
+    http.end();
+  }
+}
+
+void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz) {
+  if (sendQueue == NULL) return;
+
+  // 낙상이 서버에 전달된 게 확인되면 그때 낙상 표시를 내림 (실패하면 다음 메시지에 다시 실림)
+  if (fallDelivered) {
+    pendingFallDetected = false;
+    pendingFallConfidence = 0.0f;
+    fallDelivered = false;
+  }
 
   StaticJsonDocument<512> doc;   // 400 -> 512 (fallDetected/fallConfidence 추가로 여유 확보)
   doc["deviceId"] = deviceId;
@@ -322,16 +350,13 @@ void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz) 
     doc["zoneId"] = zoneNameForMajor(zoneMajor);
   }
 
-  String body;
-  serializeJson(doc, body);
+  SendMsg msg;
+  msg.hadFall = pendingFallDetected;
+  serializeJson(doc, msg.body, sizeof(msg.body));
+  xQueueOverwrite(sendQueue, &msg);   // 우편함에 넣고 바로 리턴 (응답 기다리지 않음)
 
-  int code = http.POST(body);
-  Serial.printf("[raw 전송] 응답코드 %d\n", code);
-  if (code > 0) {   // 전송 성공했을 때만 초기화 (실패하면 다음 전송 때 다시 보냄)
-    pendingFallDetected = false;
-    pendingFallConfidence = 0.0f;
-  }
-  http.end();
+  // 낙상이 아닐 때만 확률 초기화 (확률 = 직전 전송 이후 최고값)
+  if (!pendingFallDetected) pendingFallConfidence = 0.0f;
 }
 
 // ═══════════════════════════════════════════════════════
@@ -389,6 +414,15 @@ void setup() {
     } else {
       Serial.println("비콘 스캔 태스크 시작 (core 0)");
     }
+  }
+
+  sendQueue = xQueueCreate(1, sizeof(SendMsg));
+  if (sendQueue == NULL ||
+      xTaskCreatePinnedToCore(sendTask, "SensorSend", 8192, NULL, 1, NULL, 0) != pdPASS) {
+    Serial.println("[전송] 태스크 생성 실패 — 서버 전송 비활성화");
+    sendQueue = NULL;
+  } else {
+    Serial.println("서버 전송 태스크 시작 (core 0)");
   }
 }
 
@@ -459,9 +493,16 @@ void loop() {
   latestHealthAbnormal = healthAbnormal;
 
   // 설계 원칙 1: 불안정 감지되면 네트워크 상관없이 즉시 버저
-  if (level != SafetyLevel::NORMAL) {
+  // 경고음은 단계가 바뀔 때, 또는 같은 단계가 이어지면 3초에 한 번만 울림
+  // (매 루프마다 tone()을 부르면 소리가 끝날 때까지 루프가 막혀 판정이 4회/초로 떨어짐)
+  static SafetyLevel lastBuzzLevel = SafetyLevel::NORMAL;
+  static unsigned long lastBuzzMs = 0;
+  if (level != SafetyLevel::NORMAL &&
+      (level != lastBuzzLevel || now - lastBuzzMs >= 3000)) {
     soundBuzzer(level);
+    lastBuzzMs = now;
   }
+  lastBuzzLevel = level;
 }
 
 // ═══════════════════════════════════════════════════════

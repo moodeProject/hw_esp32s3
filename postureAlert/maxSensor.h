@@ -71,7 +71,13 @@ long lastIrForBeat = 0;
 float beatsPerMinute = 0;
 int rateBuf[4];
 int rateBufIndex = 0;
-long lastBeatMs = 0;
+int rateCount = 0;   // rateBuf에 실제로 채워진 개수 (최대 4) - 빈칸(0)까지 평균내던 문제 수정
+
+// 박동 간격은 millis() 대신 센서 샘플 번호로 계산
+// (한 루프에서 샘플 여러 개를 읽으면 millis()가 같게 찍히기 때문)
+#define MAX_SAMPLE_PERIOD_MS 10      // 400sps ÷ 평균4 = 100sps → 샘플 1개 = 10ms
+unsigned long maxSampleNo = 0;       // 센서 샘플 번호 (시간 대신 사용)
+unsigned long lastBeatSampleNo = 0;  // 직전 박동이 잡힌 샘플 번호
 
 // ── HRV(RMSSD) 계산용 ─────────────────────────────────────
 #define IBI_BUF_SIZE 10
@@ -122,23 +128,29 @@ void recordIbi(long deltaMs);
 // ═══════════════════════════════════════════════════════
 void updateBpmFromSample(long irValue) {
   if (checkForBeat(irValue)) {
-    long now = millis();
-    long delta = now - lastBeatMs;
-    lastBeatMs = now;
+    long delta = (long)(maxSampleNo - lastBeatSampleNo) * MAX_SAMPLE_PERIOD_MS;
+    lastBeatSampleNo = maxSampleNo;
 
-    float bpm = 60.0f / (delta / 1000.0f);
-    Serial.printf("[비트 감지] delta=%ldms bpm=%.1f\n", delta, bpm);  // [디버그, 원인 확인 후 삭제]
+    float bpm = 60000.0f / delta;
 
-    if (bpm > 20 && bpm < 255) {
-      rateBuf[rateBufIndex++] = (int)bpm;
-      rateBufIndex %= 4;
+    // 놓친 박동 / 가짜 박동 걸러내기
+    static long lastGoodIbi = 0;  // 직전에 받은 정상 범위 박동 간격(ms)
+    bool inRange = (delta >= 300 && delta <= 1500);                     // 40~200bpm만 인정
+    bool consistent = (lastGoodIbi == 0) ||
+                      (labs(delta - lastGoodIbi) < lastGoodIbi * 0.3f);  // 직전 간격과 30% 이내
+    if (!inRange) return;
+    lastGoodIbi = delta;          // 튄 값이어도 기준은 갱신 (계속 막히지 않게)
+    if (!consistent) return;      // 튄 값은 BPM/HRV에 안 넣음
 
-      int sum = 0;
-      for (int i = 0; i < 4; i++) sum += rateBuf[i];
-      beatsPerMinute = sum / 4.0f;
+    rateBuf[rateBufIndex] = (int)bpm;
+    rateBufIndex = (rateBufIndex + 1) % 4;
+    if (rateCount < 4) rateCount++;
 
-      recordIbi(delta);  // HRV 계산용 비트 간격 기록
-    }
+    int sum = 0;
+    for (int i = 0; i < rateCount; i++) sum += rateBuf[i];
+    beatsPerMinute = (float)sum / rateCount;
+
+    recordIbi(delta);  // HRV 계산용 비트 간격 기록
   }
 }
 
@@ -205,14 +217,19 @@ float calcSpo2FromWindow() {
 // 매 loop()마다 호출 — 샘플 추가 + 실시간 BPM 갱신
 // ═══════════════════════════════════════════════════════
 void updateVitalsBuffer(float gyroStd) {
-  long irValue = particleSensor.getIR();
-  long redValue = particleSensor.getRed();
+  // 새 값이 있을 때만 읽음 (getIR/getRed처럼 최대 0.25초씩 기다리지 않음)
+  // → MAX30102가 잠깐 멈춰도 추락 감지 루프(50Hz)는 느려지지 않음
+  particleSensor.check();
+  if (!particleSensor.available()) return;   // 새 값이 없으면 이번 루프는 건너뜀
 
-  // [디버그] 원시값 확인용 - 하드웨어 테스트 끝나면 지우기
-  static unsigned long lastPrintMs = 0;
-  if (millis() - lastPrintMs > 200) {
-    Serial.printf("[MAX30102 원시값] IR:%ld Red:%ld\n", irValue, redValue);
-    lastPrintMs = millis();
+  long irValue = 0, redValue = 0;
+  while (particleSensor.available()) {        // 쌓인 값 중 가장 최신 것만 사용
+    irValue = particleSensor.getFIFOIR();
+    redValue = particleSensor.getFIFORed();
+    particleSensor.nextSample();
+    maxSampleNo++;
+    // 손가락/피부 접촉 상태에서만, 샘플 하나도 안 버리고 박동 검출에 넣음
+    if (irValue > IR_FINGER_THRESHOLD) updateBpmFromSample(irValue);
   }
 
   bufIr[vitalsIndex] = irValue;
@@ -220,12 +237,12 @@ void updateVitalsBuffer(float gyroStd) {
   vitalsIndex = (vitalsIndex + 1) % VITALS_WINDOW_SIZE;
   if (vitalsCount < VITALS_WINDOW_SIZE) vitalsCount++;
 
-  // 손가락/피부 접촉 상태에서만 BPM 실시간 갱신
-  if (irValue > IR_FINGER_THRESHOLD) {
-    updateBpmFromSample(irValue);
-  }
-
   if (vitalsCount < VITALS_WINDOW_SIZE) return;  // 윈도우 아직 안 참
+
+  // 윈도우가 찬 뒤에는 250개(약 5초)마다 한 번만 판정 (매 샘플마다 판정/출력하던 문제 수정)
+  static int samplesSinceWindow = 0;
+  if (++samplesSinceWindow < VITALS_WINDOW_SIZE) return;
+  samplesSinceWindow = 0;
 
   // ── 윈도우 하나 다 찼을 때 최종 판정 ──
   double irMeanCheck = 0;
@@ -245,9 +262,6 @@ void updateVitalsBuffer(float gyroStd) {
   lastBpm = beatsPerMinute;
   lastSpo2 = calcSpo2FromWindow();
   lastHrv = calcHrvRmssd();
-
-  // [디버그] 실시간 확인용 - 하드웨어 테스트 끝나면 지우기
-  Serial.printf("[윈도우 완료] BPM=%.1f HRV=%.1f (ibiCount=%d)\n", lastBpm, lastHrv, ibiCount);
 
   // ── 착용 시작 시점 기록 (첫 유효 윈도우 기준) ──
   if (!wearStarted) {
