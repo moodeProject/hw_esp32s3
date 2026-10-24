@@ -223,6 +223,11 @@ const float HEAT_HR_FALLBACK_BPM = 110.0f;            // 개인 기준선 확정
 unsigned long restCandidateStartMs = 0;
 unsigned long lastRestMs = 0;
 volatile bool weatherHot = false;   // weatherTask가 갱신 (heatRiskLevel >= RECOMMEND)
+volatile unsigned long weatherOkMs = 0;  // 마지막으로 기상 조회에 성공한 시각
+// 조회가 계속 실패하면 직전 폭염 값을 이 시간까지만 믿는다 (짧은 네트워크 장애는 버팀)
+#define WEATHER_STALE_MS 1800000UL
+// 심박이 이 시간 넘게 갱신되지 않으면(미착용·모션) 직전 고심박으로 판정하지 않는다
+#define HEART_STALE_MS 30000UL
 #define WEATHER_REFRESH_MS 600000UL  // 서버 캐시도 10분 주기라 더 자주 볼 필요 없음
 #define WEATHER_RETRY_MS 30000UL
 
@@ -324,9 +329,12 @@ PostureStatus classifyPosture() {
   float tiltSum = 0, tiltMax = -1e9;
   float gyroSum = 0, gyroSumSq = 0;
 
+  // 링버퍼라 물리 인덱스 0..N-1 은 시간순이 아니다. 윈도우가 찬 뒤 bufIndex 는 다음에 덮어쓸
+  // 자리 = 가장 오래된 샘플이므로 거기서부터 읽어 tilt[] 를 시간순으로 채운다 (slope 회귀용).
   for (int i = 0; i < POSTURE_WINDOW_SIZE; i++) {
-    tilt[i] = tiltAngleDeg(bufAx[i], bufAy[i], bufAz[i]);
-    gyroSvm[i] = sqrtf(bufGx[i] * bufGx[i] + bufGy[i] * bufGy[i] + bufGz[i] * bufGz[i]);
+    int idx = (bufIndex + i) % POSTURE_WINDOW_SIZE;
+    tilt[i] = tiltAngleDeg(bufAx[idx], bufAy[idx], bufAz[idx]);
+    gyroSvm[i] = sqrtf(bufGx[idx] * bufGx[idx] + bufGy[idx] * bufGy[idx] + bufGz[idx] * bufGz[idx]);
 
     tiltSum += tilt[i];
     if (tilt[i] > tiltMax) tiltMax = tilt[i];
@@ -422,7 +430,8 @@ void announceSituation(PostureStatus posture, bool healthAbnormal, unsigned long
 
 /** 폭염 + 심박 상승 + 휴식 없이 NO_REST_LIMIT_MS 이상 활동 중이면 true. */
 bool isHeatstrokeRisk(unsigned long now) {
-  if (!weatherHot || lastBpm <= 0) return false;
+  if (!weatherHot || weatherOkMs == 0 || now - weatherOkMs > WEATHER_STALE_MS) return false;
+  if (lastBpm <= 0 || lastBpmMs == 0 || now - lastBpmMs > HEART_STALE_MS) return false;
   float hrLimit = baselineReady ? baselineHrMean + HEAT_HR_MARGIN : HEAT_HR_FALLBACK_BPM;
   if (lastBpm <= hrLimit) return false;
   return now - lastRestMs >= NO_REST_LIMIT_MS;
@@ -513,6 +522,7 @@ void weatherTask(void* param) {
           weatherHot = strcmp(level, "RECOMMEND") == 0 || strcmp(level, "ACTION_REQUIRED") == 0;
           float apparent = doc["data"]["apparentTemperature"] | -999.0f;
           Serial.printf("[기상] 체감온도 %.1f, level=%s -> 폭염=%d\n", apparent, level, weatherHot);
+          weatherOkMs = millis();
           ok = true;
         }
       }
@@ -771,7 +781,9 @@ void loop() {
         lastSendMs = now;                          // 정기 전송 타이머 리셋
         sendSensorData(ax, ay, az, gx, gy, gz);    // 200ms 기다리지 않고 즉시 전송
         // 낙상 후 움직임이 없는지 감시 시작 (의식불명 판정)
-        if (!unconscious) {
+        // 보정 전에는 자이로 오프셋을 몰라 정지도 움직임으로 잡히므로 감시를 시작하지 않는다
+        // (낙상 자체는 위에서 이미 즉시 전송됨)
+        if (!unconscious && postureCalibrated) {
           unconsciousWatching = true;
           unconsciousWatchStartMs = now;
         }

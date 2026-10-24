@@ -63,6 +63,7 @@ int vitalsCount = 0;
 
 // ── 최근 계산 결과 캐시 ────────────────────────────────────
 float lastBpm = 0;
+unsigned long lastBpmMs = 0;   // lastBpm 을 마지막으로 갱신한 시각 (오래된 심박 판정 방지용)
 float lastSpo2 = 0;
 bool lastVitalsAbnormal = false;
 
@@ -260,6 +261,7 @@ void updateVitalsBuffer(float gyroStd) {
   }
 
   lastBpm = beatsPerMinute;
+  lastBpmMs = millis();
   lastSpo2 = calcSpo2FromWindow();
   lastHrv = calcHrvRmssd();
 

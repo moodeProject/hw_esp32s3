@@ -79,6 +79,10 @@ void playPcm(const int16_t* samples, size_t length) {
 }
 
 void playVoice(VoiceClip clip) {
+  if (!i2sReady) {
+    Serial.println("[재생] 실패 — I2S 미초기화 (p 명령으로 핀 확인)");
+    return;
+  }
   const VoiceClipData& c = VOICE_CLIPS[(int)clip];
   Serial.printf("[재생] %s (%.1fs)\n", c.text, c.length / (float)VOICE_SAMPLE_RATE);
   playPcm(c.samples, c.length);
