@@ -174,6 +174,9 @@ bool postureCalibrated = false;
 float calibSumX = 0, calibSumY = 0, calibSumZ = 0;
 float calibGyroSumX = 0, calibGyroSumY = 0, calibGyroSumZ = 0;
 int calibCount = 0;
+// 보정 완료 시 저장하는 정지 상태 자이로 평균(고정 오프셋). 의식불명 판정이 이 값을 빼고
+// 실제 회전만으로 움직임을 본다. 재보정 중에는 직전 값을 그대로 쓴다.
+float gyroOffX = 0.0f, gyroOffY = 0.0f, gyroOffZ = 0.0f;
 
 // ── 온보드 낙상 감지 결과 ───────────────────────────────────
 // 판정은 20ms마다, 정기 전송은 200ms마다라서 그 사이에 잡힌 낙상을 놓치지 않도록
@@ -194,7 +197,8 @@ unsigned long lastVoiceMs = 0;
 
 // ── 의식불명 판정: 낙상 감지 후 일정 시간 움직임이 없음 ─────────
 // 낙상 직후에는 충격/뒹굴기로 자이로가 크게 튀므로 SETTLE 동안은 무시하고,
-// 그 뒤 STILL 동안 자이로 크기가 MOVE_DPS를 한 번도 넘지 않으면 의식불명으로 본다.
+// 그 뒤 STILL 동안 자이로 크기(보정 때 잰 오프셋을 뺀 값)가 MOVE_DPS를 한 번도 넘지 않으면
+// 의식불명으로 본다. 보정 전에는 오프셋이 0이라 정지해도 움직임으로 잡힐 수 있다.
 // 값은 아직 실측 전 — 시연 시나리오(헬멧 내려놓기 등) 돌려보며 조정 필요.
 const unsigned long UNCONSCIOUS_SETTLE_MS = 2000UL;
 const unsigned long UNCONSCIOUS_STILL_MS  = 10000UL;
@@ -290,10 +294,12 @@ void updatePostureCalibration(float ax, float ay, float az, float gx, float gy, 
   g0x = calibSumX / norm;
   g0y = calibSumY / norm;
   g0z = calibSumZ / norm;
+  gyroOffX = calibGyroSumX / calibCount;
+  gyroOffY = calibGyroSumY / calibCount;
+  gyroOffZ = calibGyroSumZ / calibCount;
   postureCalibrated = true;
   Serial.printf("[자세] 기준 자세 저장 완료 (g0=%.3f, %.3f, %.3f, 정지 시 자이로 오프셋=%.1f, %.1f, %.1f °/s)\n",
-                g0x, g0y, g0z, calibGyroSumX / calibCount, calibGyroSumY / calibCount,
-                calibGyroSumZ / calibCount);
+                g0x, g0y, g0z, gyroOffX, gyroOffY, gyroOffZ);
 }
 
 /** 현재 가속도 벡터와 기준 자세 g0 사이의 각도(도). 보정 전에는 g0=(0,0,1)이라 절대 기울기. */
@@ -429,7 +435,9 @@ void updateRestTracking(unsigned long now) {
  * 의식불명 상태에서 움직임이 잡히면 해제한다.
  */
 void updateUnconsciousWatch(float ax, float ay, float az, float gx, float gy, float gz, unsigned long now) {
-  float gyroMag = sqrtf(gx * gx + gy * gy + gz * gz);
+  // 고정 오프셋(~46°/s)을 빼지 않으면 가만히 있어도 MOVE_DPS(30)를 넘어 의식불명이 확정되지 않는다
+  float dx = gx - gyroOffX, dy = gy - gyroOffY, dz = gz - gyroOffZ;
+  float gyroMag = sqrtf(dx * dx + dy * dy + dz * dz);
   bool moving = gyroMag > UNCONSCIOUS_MOVE_DPS;
 
   if (unconscious) {
