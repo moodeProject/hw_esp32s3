@@ -4,7 +4,8 @@
 // 경고음(버저)은 MAX98357A 스피커 음성 안내로 교체됨 (voicePlayer.h, announceSituation()):
 //   자세 이상만 or 건강 이상만   -> "비정상적인 징후가 감지되었습니다. 조심해주세요."
 //   자세 + 건강 둘 다 이상       -> "즉시 작업을 중단하고 휴식을 취하세요."
-//   낙상 후 움직임 없음(의식불명) -> "의식불명으로 판별되어 관리자에게 연락을 취하고 있습니다."
+//   낙상 후 10초 움직임 없음      -> "괜찮으시면 고개를 움직여 주세요." (본인 확인, 관리자 전송 전)
+//   그 뒤 20초 더 움직임 없음     -> "의식불명으로 판별되어 관리자에게 연락을 취하고 있습니다."
 //   폭염 + 고심박 + 휴식 없음     -> "열사병 위험이 있으니 휴식을 취해주세요."
 //
 // 설계 원칙(아키텍처 표 그대로):
@@ -197,14 +198,19 @@ unsigned long lastVoiceMs = 0;
 
 // ── 의식불명 판정: 낙상 감지 후 일정 시간 움직임이 없음 ─────────
 // 낙상 직후에는 충격/뒹굴기로 자이로가 크게 튀므로 SETTLE 동안은 무시하고,
-// 그 뒤 STILL 동안 자이로 크기(보정 때 잰 오프셋을 뺀 값)가 MOVE_DPS를 한 번도 넘지 않으면
-// 의식불명으로 본다. 보정 전에는 오프셋이 0이라 정지해도 움직임으로 잡힐 수 있다.
+// 그 뒤 자이로 크기(보정 때 잰 오프셋을 뺀 값)가 MOVE_DPS를 한 번도 넘지 않으면
+// CHECK 후 본인 확인 안내, 다시 CONFIRM 동안 조용하면 의식불명으로 확정한다.
+// 보정 전에는 오프셋이 0이라 정지해도 움직임으로 잡힐 수 있다.
 // 값은 아직 실측 전 — 시연 시나리오(헬멧 내려놓기 등) 돌려보며 조정 필요.
-const unsigned long UNCONSCIOUS_SETTLE_MS = 2000UL;
-const unsigned long UNCONSCIOUS_STILL_MS  = 10000UL;
+// 시연 때는 CHECK/CONFIRM 을 줄여서 쓰면 된다 (현장 기준이면 더 길게).
+const unsigned long UNCONSCIOUS_SETTLE_MS  = 2000UL;
+const unsigned long UNCONSCIOUS_CHECK_MS   = 10000UL;  // 이만큼 조용하면 본인 확인 안내
+const unsigned long UNCONSCIOUS_CONFIRM_MS = 20000UL;  // 안내 후 이만큼 더 조용하면 의식불명 확정
 const float UNCONSCIOUS_MOVE_DPS = 30.0f;
 bool unconsciousWatching = false;   // 낙상 후 움직임 감시 중
 unsigned long unconsciousWatchStartMs = 0;
+bool unconsciousCheckPrompted = false;  // 본인 확인 안내를 했고 응답(움직임)을 기다리는 중
+unsigned long unconsciousCheckMs = 0;
 bool unconscious = false;           // 의식불명 확정 (움직임 생기면 해제)
 
 // ── 열사병 판정: 폭염(서버 기상) + 심박 상승 + 쉬지 않고 계속 활동 ─────
@@ -385,6 +391,9 @@ SafetyLevel determineSafetyLevel(PostureStatus posture, bool healthAbnormal) {
  * 다음 이상이 생기면 바로 안내한다.
  */
 void announceSituation(PostureStatus posture, bool healthAbnormal, unsigned long now) {
+  // 본인 확인 안내 후 응답을 기다리는 동안은 다른 안내로 덮어쓰지 않는다
+  if (unconsciousCheckPrompted) return;
+
   bool unstable = VOICE_USE_POSTURE && postureCalibrated &&
                   (posture == PostureStatus::STUMBLE || posture == PostureStatus::COLLAPSE);
 
@@ -430,9 +439,11 @@ void updateRestTracking(unsigned long now) {
 }
 
 /**
- * 낙상 후 움직임 감시. 매 샘플 호출. 감시 중 SETTLE 이후에 움직임이 잡히면 감시 해제,
- * STILL 동안 조용하면 의식불명 확정 + 관리자 쪽으로 즉시 전송.
- * 의식불명 상태에서 움직임이 잡히면 해제한다.
+ * 낙상 후 움직임 감시. 매 샘플 호출. 2단계로 확정한다:
+ *   1) SETTLE 이후 CHECK 동안 움직임이 없으면 본인 확인 안내만 한다 (관리자에게는 아직 안 보냄)
+ *   2) 안내 후 CONFIRM 동안에도 움직임이 없으면 의식불명 확정 + 서버로 즉시 전송
+ * 어느 단계든 움직임이 잡히면(고개 끄덕이기 등) 감시를 끝낸다. 의식불명 상태에서 움직이면 해제.
+ * 낙상 자체는 감지 순간 이미 서버로 갔으므로 이 감시와 무관하게 관리자 화면에 뜬다.
  */
 void updateUnconsciousWatch(float ax, float ay, float az, float gx, float gy, float gz, unsigned long now) {
   // 고정 오프셋(~46°/s)을 빼지 않으면 가만히 있어도 MOVE_DPS(30)를 넘어 의식불명이 확정되지 않는다
@@ -453,16 +464,28 @@ void updateUnconsciousWatch(float ax, float ay, float az, float gx, float gy, fl
   if (elapsed < UNCONSCIOUS_SETTLE_MS) return;
   if (moving) {
     unconsciousWatching = false;
-    Serial.println("[의식불명 감시] 움직임 있음 — 감시 종료");
+    Serial.println(unconsciousCheckPrompted ? "[의식불명 감시] 본인 확인 응답(움직임) — 감시 종료"
+                                            : "[의식불명 감시] 움직임 있음 — 감시 종료");
+    unconsciousCheckPrompted = false;
     return;
   }
-  if (elapsed >= UNCONSCIOUS_SETTLE_MS + UNCONSCIOUS_STILL_MS) {
+  if (!unconsciousCheckPrompted) {
+    if (elapsed >= UNCONSCIOUS_SETTLE_MS + UNCONSCIOUS_CHECK_MS) {
+      unconsciousCheckPrompted = true;
+      unconsciousCheckMs = now;
+      Serial.println("[의식불명 감시] 움직임 없음 — 본인 확인 안내");
+      requestVoice(VoiceClip::CHECK_RESPONSE);
+      lastVoiceClip = (int)VoiceClip::CHECK_RESPONSE;
+      lastVoiceMs = now;
+    }
+    return;
+  }
+  if (now - unconsciousCheckMs >= UNCONSCIOUS_CONFIRM_MS) {
     unconsciousWatching = false;
+    unconsciousCheckPrompted = false;
     unconscious = true;
-    Serial.println("[의식불명] 낙상 후 움직임 없음 — 관리자 알림 전송");
-    // 서버에는 의식불명 전용 필드가 없어서 낙상 플래그를 다시 실어 즉시 보낸다
-    // (서버가 FALL 알림 + hazard event로 관리자 대시보드에 올림).
-    pendingFallDetected = true;
+    Serial.println("[의식불명] 본인 확인 안내 후에도 움직임 없음 — 관리자 알림 전송");
+    // sendSensorData()가 unconscious=true 를 실어 보내면 서버가 UNCONSCIOUS 위험 이벤트를 만든다.
     lastSendMs = now;
     sendSensorData(ax, ay, az, gx, gy, gz);
     requestVoice(VoiceClip::UNCONSCIOUS);  // 자세 윈도우(3초) 차기 전이라도 바로 안내
@@ -579,6 +602,8 @@ void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz) 
   // 온보드 낙상 판정 결과 (기존 FastAPI /predict 응답의 fallDetected / confidence 자리)
   doc["fallDetected"] = pendingFallDetected;
   doc["fallConfidence"] = pendingFallConfidence;
+  // 의식불명 확정 상태 (서버가 UNCONSCIOUS 추락 상태 + 위험 이벤트로 처리). 움직이면 false 로 돌아감.
+  doc["unconscious"] = unconscious;
 
   // 서버 SensorDataRequest에 zoneId 필드가 추가되어(server PR: feat/zone-id-sensor-data)
   // 이제 실제로 같이 보낸다. 유효한 구역이 없으면 zoneId 필드 자체를 넣지 않는다
@@ -680,11 +705,11 @@ void setup() {
 }
 
 void loop() {
-  // [테스트용] 시리얼에 1~4 입력 시 해당 안내 음성 바로 재생 (스피커 동작 확인)
+  // [테스트용] 시리얼에 1~5 입력 시 해당 안내 음성 바로 재생 (스피커 동작 확인)
   //           'c' 입력 시 기준 자세 재보정 (다시 정지 3초)
   if (Serial.available()) {
     char c = Serial.read();
-    if (c >= '1' && c <= '4') requestVoice((VoiceClip)(c - '1'));
+    if (c >= '1' && c <= '5') requestVoice((VoiceClip)(c - '1'));
     else if (c == 'c') startPostureCalibration();
   }
 

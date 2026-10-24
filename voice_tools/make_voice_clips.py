@@ -27,6 +27,7 @@ CLIPS = [
     ("STOP_AND_REST", "즉시 작업을 중단하고 휴식을 취하세요."),
     ("UNCONSCIOUS", "의식불명으로 판별되어 관리자에게 연락을 취하고 있습니다."),
     ("HEATSTROKE", "열사병 위험이 있으니 휴식을 취해주세요."),
+    ("CHECK_RESPONSE", "괜찮으시면 고개를 움직여 주세요."),
 ]
 
 PS_TEMPLATE = r"""
