@@ -11,10 +11,18 @@ collect_mode.ino를 올린 ESP32-S3에 시리얼로 연결해서, 미리 정해�
     python collect_session.py --port COM5 --scenario stagger
     python collect_session.py --port COM5 --scenario collapse
     python collect_session.py --port COM5 --scenario mixed
+    python collect_session.py --port COM5 --scenario normal_v2      # 상대 기울기용(calib_stand 포함)
+    python collect_session.py --port COM5 --scenario stagger_v2
+    python collect_session.py --port COM5 --scenario collapse_v2
+    python collect_session.py --port COM5 --scenario stagger_fall
 
 --scenario normal 은 "정상" 동작만 다양하게(걷기/앉기·서기/숙이기/고개돌림/
 쭈그려앉기/도구사용) 모으기 위한 프리셋이다. 학습용 label은 전부 "normal"로
 저장되고, 세부 동작 이름은 phase 컬럼에 별도로 남는다(다양성 확인/디버깅용).
+
+*_v2 / stagger_fall 프리셋은 맨 앞에 calib_stand(정지 6초) 구간이 있다.
+analyze_thresholds.py 가 이 구간의 가속도 평균을 착용 기준 자세(g0)로 잡아서
+펌웨어(postureAlert.ino)와 같은 "g0 대비 상대 기울기"로 분석한다.
 
 수집된 파일: sessions/session_<id>_<scenario>_<timestamp>.csv
 컬럼: t_ms,ax,ay,az,gx,gy,gz,label,phase,sessionId
@@ -78,7 +86,51 @@ SCENARIOS = {
         ("gradual_collapse", "gradual_collapse", 6),
         ("normal", "normal", 8),
     ],
+    # ── v2: 맨 앞 calib_stand로 기준 자세(g0)를 잡아 상대 기울기로 분석하는 프리셋 ──
+    "normal_v2": [
+        ("calib_stand", "normal", 6),
+        ("walk_normal", "normal", 15),
+        ("look_around", "normal", 12),
+        ("bend_pickup", "normal", 14),
+        ("squat", "normal", 12),
+        ("sit_chair", "normal", 12),
+        ("fast_walk", "normal", 12),
+        ("bow_nod", "normal", 10),
+        ("tool_reach", "normal", 10),
+    ],
+    "stagger_v2": [
+        ("calib_stand", "normal", 6),
+        ("normal", "normal", 5),
+        ("stagger_forward", "stagger", 7),
+        ("normal", "normal", 5),
+        ("stagger_backward", "stagger", 7),
+        ("normal", "normal", 5),
+        ("stagger_lateral", "stagger", 7),
+        ("normal", "normal", 5),
+        ("stagger_dizzy", "stagger", 7),
+        ("normal", "normal", 5),
+    ],
+    "collapse_v2": [
+        ("calib_stand", "normal", 6),
+        ("normal", "normal", 5),
+        ("slump_forward", "gradual_collapse", 8),
+        ("get_up", "normal", 6),
+        ("slide_down_wall", "gradual_collapse", 8),
+        ("get_up", "normal", 6),
+        ("lean_side", "gradual_collapse", 8),
+        ("get_up", "normal", 6),
+    ],
+    "stagger_fall": [
+        ("calib_stand", "normal", 6),
+        ("normal", "normal", 4),
+        ("stagger_then_fall", "stagger", 6),
+        ("lie_still", "lie_still", 12),  # 정지 상태라 붕괴 "동작" 임계값 계산에서 제외
+        ("get_up", "normal", 6),
+    ],
 }
+
+# 이상 동작 구간 공통 안내 — 구간 앞 1초는 transition으로 버려지므로 그 뒤에 시작하게 한다
+_WAIT = "삐 소리 후 1초 기다렸다가 시작하세요. "
 
 # phase 이름 -> 사람이 읽고 바로 따라할 수 있는 동작 안내문
 PHASE_INSTRUCTIONS = {
@@ -89,13 +141,27 @@ PHASE_INSTRUCTIONS = {
     "kneel_squat": "쭈그려 앉거나 무릎을 꿇었다 일어나기를 반복하세요",
     "tool_use_arm_motion": "팔을 뻗어 도구를 사용하는 동작을 반복하세요",
     "normal": "평소처럼 자연스럽게 움직이세요 (걷기/작업 등)",
-    "stagger_forward": "앞으로 휘청거리다가 균형을 잡으세요",
-    "stagger_backward": "뒤로 휘청거리다가 균형을 잡으세요",
-    "stagger_lateral": "옆으로 휘청거리다가 균형을 잡으세요",
-    "slump_forward": "천천히 앞으로 무너지듯 주저앉으세요",
-    "slide_down_wall": "벽을 짚고 천천히 미끄러지듯 주저앉으세요",
+    "stagger_forward": _WAIT + "발이 걸린 듯 앞으로 휘청 → 2~3걸음 버티고 정지",
+    "stagger_backward": _WAIT + "뒤로 미끄러진 듯 휘청 → 뒷걸음 2~3걸음 후 정지",
+    "stagger_lateral": _WAIT + "발목 접질린 듯 옆으로 휘청 → 반대발로 버티고 정지",
+    "slump_forward": _WAIT + "고개 툭 → 4초간 천천히 무릎 꿇으며 앞으로 숙임 → 정지",
+    "slide_down_wall": _WAIT + "벽에 등 대고 4초간 미끄러져 앉기, 고개 한쪽으로 → 정지",
     "stagger": "휘청거리는 동작을 하세요",
     "gradual_collapse": "천천히 쓰러지듯 무너지는 동작을 하세요",
+    # v2 프리셋 phase
+    "calib_stand": "발 어깨너비, 정면 한 점 응시, 움직이지 마세요(기준 자세)",
+    "walk_normal": "평소 속도로 자유롭게 걸어다니세요",
+    "look_around": "제자리에서 고개를 좌우·위아래로 돌리며 주변을 둘러보세요",
+    "squat": "쭈그려 앉았다 일어나기를 천천히 반복하세요",
+    "sit_chair": "의자에 앉았다 일어나기를 반복하세요",
+    "fast_walk": "빠른 걸음으로 걸어다니세요 (뛰지는 마세요)",
+    "bow_nod": "고개를 숙여 인사하거나 끄덕이는 동작을 반복하세요",
+    "tool_reach": "팔을 위·옆으로 뻗어 도구를 집거나 쓰는 동작을 반복하세요",
+    "stagger_dizzy": _WAIT + "제자리에서 상체·머리가 좌우로 크게 3번 흔들림, 마지막에 무릎 짚기",
+    "lean_side": _WAIT + "쭈그린 자세에서 4초간 옆으로 기울어 손 짚고 기대기 → 정지",
+    "get_up": "천천히 일어나서 똑바로 서세요",
+    "stagger_then_fall": _WAIT + "휘청 2~3걸음 → 무릎·손·옆구리 순으로 매트에 넘어짐(머리 보호)",
+    "lie_still": "누운 채 전혀 움직이지 마세요",
 }
 
 # 구간 경계 앞뒤로 이 시간만큼은 "transition"으로 표시해 학습 시 제외를 권장한다.

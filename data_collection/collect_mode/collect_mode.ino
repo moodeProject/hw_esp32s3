@@ -24,6 +24,16 @@ void setup() {
   Wire.write(0);
   Wire.endTransmission();
 
+  // 측정 범위를 시연 펌웨어(postureAlert.ino)와 맞춘다 — 기본값(±2g/±250°/s)은 충격·회전이 잘림
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1C);   // 가속도 범위 설정 레지스터
+  Wire.write(0x18);   // ±16g
+  Wire.endTransmission();
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1B);   // 자이로 범위 설정 레지스터
+  Wire.write(0x18);   // ±2000°/s
+  Wire.endTransmission();
+
   Serial.println("READY");
 }
 
@@ -41,12 +51,12 @@ void readMpu(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
   int16_t gy_raw = Wire.read() << 8 | Wire.read();
   int16_t gz_raw = Wire.read() << 8 | Wire.read();
 
-  ax = ax_raw / 16384.0;
-  ay = ay_raw / 16384.0;
-  az = az_raw / 16384.0;
-  gx = gx_raw / 131.0;
-  gy = gy_raw / 131.0;
-  gz = gz_raw / 131.0;
+  ax = ax_raw / 2048.0;   // g 단위 (±16g 기준: 2048 = 1g)
+  ay = ay_raw / 2048.0;
+  az = az_raw / 2048.0;
+  gx = gx_raw / 16.4;     // deg/s (±2000°/s 기준: 16.4 = 1°/s)
+  gy = gy_raw / 16.4;
+  gz = gz_raw / 16.4;
 }
 
 void loop() {
