@@ -124,7 +124,7 @@ SCENARIOS = {
         ("calib_stand", "normal", 6),
         ("normal", "normal", 4),
         ("stagger_then_fall", "stagger", 6),
-        ("lie_still", "gradual_collapse", 12),
+        ("lie_still", "lie_still", 12),  # 정지 상태라 붕괴 "동작" 임계값 계산에서 제외
         ("get_up", "normal", 6),
     ],
 }

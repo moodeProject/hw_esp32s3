@@ -1,7 +1,7 @@
 """
 휘청거림/자세붕괴 임계값 튜닝용 분석 스크립트
 ────────────────────────────────────────────────
-collect_session.py로 모은 라벨링된 CSV(normal / stagger / gradual_collapse / transition)를
+collect_session.py로 모은 라벨링된 CSV(normal / stagger / gradual_collapse / lie_still / transition)를
 posture_alert_logic.py의 classify_posture()와 동일한 피처(tilt_max, tilt_mean, gyro_std, slope)로
 윈도우 단위 계산한 뒤, 라벨별 분포를 비교해서 THRESH_* 값을 얼마로 잡아야 할지 보여준다.
 
@@ -13,8 +13,8 @@ posture_alert_logic.py의 classify_posture()와 동일한 피처(tilt_max, tilt_
 기울기 계산 방식:
   --relative(기본): 세션마다 calib_stand 구간 가속도 평균 방향을 착용 기준 자세(g0)로 잡고,
                     tilt = 현재 가속도 벡터와 g0 사이 각도. 펌웨어(postureAlert.ino)와 동일.
-                    calib_stand 구간이 없는 옛 세션은 normal 라벨 중 가장 조용한 3초 윈도우의
-                    평균으로 g0를 추정한다(경고 출력).
+                    calib_stand 구간이 없는 옛 세션은 바로 선 구간을 알 수 없어 절대 기울기로
+                    대체한다(경고 출력). 상대 기울기 튜닝에는 *_v2 / stagger_fall 세션을 쓸 것.
   --absolute      : tilt = acos(az/|a|). 센서가 비스듬히 붙어 있으면 정자세도 ~33°로 나옴.
 
 읽는 법:
@@ -23,6 +23,8 @@ posture_alert_logic.py의 classify_posture()와 동일한 피처(tilt_max, tilt_
     normal 그룹과 stagger 그룹의 tilt_max / gyro_std 분포가 갈리는 지점으로 잡는다.
   - COLLAPSE 기준(THRESH_COLLAPSE_TILT_DEG, THRESH_COLLAPSE_SLOPE)은
     normal 그룹과 gradual_collapse 그룹의 tilt_mean / slope 분포가 갈리는 지점으로 잡는다.
+    (넘어진 뒤 누워 있는 lie_still 은 무너지는 "동작"이 아니라 정지 상태라 여기서 제외되고,
+     표에만 따로 나온다 — 의식불명 판정 튜닝 참고용)
   - "제안 임계값" 줄은 (normal 95퍼센타일 + 이상행동 5퍼센타일)의 중간값으로 자동 계산한 참고값.
     그대로 쓰지 말고 오탐/미탐 보면서 미세조정할 것.
 """
@@ -63,14 +65,9 @@ def estimate_g0(session: pd.DataFrame) -> tuple[np.ndarray, str]:
     if len(calib) > 0:
         return _unit_mean(calib), f"calib_stand {len(calib)}샘플"
 
-    # 옛 세션: normal 구간 중 자이로가 가장 조용한 3초 윈도우를 정지 자세로 간주
-    normal = session[session["label"] == "normal"].reset_index(drop=True)
-    if len(normal) >= WINDOW_SIZE:
-        gyro = np.sqrt(normal["gx"] ** 2 + normal["gy"] ** 2 + normal["gz"] ** 2)
-        start = int(gyro.rolling(WINDOW_SIZE).mean().idxmin()) - WINDOW_SIZE + 1
-        return _unit_mean(normal.iloc[start:start + WINDOW_SIZE]), "추정(가장 조용한 normal 3초)"
-
-    return ABSOLUTE_G0, "추정 불가 — 절대 기울기로 대체"
+    # 옛 세션은 바로 선 자세라고 확인할 수 있는 구간이 없다. normal 에는 앉기·쭈그려앉기도
+    # 섞여 있어서 "가장 조용한 구간"을 고르면 앉은 자세가 g0로 잡힐 수 있으므로 추정하지 않는다.
+    return ABSOLUTE_G0, "절대 기울기로 대체 (calib_stand 없음)"
 
 
 def window_features(seg: pd.DataFrame, g0: np.ndarray = ABSOLUTE_G0) -> dict | None:

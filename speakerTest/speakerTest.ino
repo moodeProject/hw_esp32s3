@@ -97,7 +97,8 @@ void playTestTone() {
 void printHelp() {
   Serial.println();
   Serial.println("=== MAX98357A 스피커 테스트 ===");
-  for (int i = 0; i < 4; i++) Serial.printf("  %d : %s\n", i + 1, VOICE_CLIPS[i].text);
+  const int clipCount = sizeof(VOICE_CLIPS) / sizeof(VOICE_CLIPS[0]);
+  for (int i = 0; i < clipCount; i++) Serial.printf("  %d : %s\n", i + 1, VOICE_CLIPS[i].text);
   Serial.println("  t : 1kHz 테스트 톤");
   Serial.printf("  v <0~100> : 볼륨 (현재 %d%%)\n", volumePercent);
   Serial.printf("  p <BCLK> <LRC> <DIN> : 핀 변경 (현재 GPIO%d GPIO%d GPIO%d, 예: p D1 D2 D3)\n",
