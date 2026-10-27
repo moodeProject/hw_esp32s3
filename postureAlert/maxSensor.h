@@ -26,10 +26,19 @@ MAX30105 particleSensor;
 // ── 윈도우 설정 ────────────────────────────────────────────
 #define VITALS_WINDOW_SIZE 250
 
-// ── 정상 범위 (일반 성인 안정 시 기준, 추후 실측 데이터로 재조정) ──
+// ── 정상 범위 ─────────────────────────────────────────────
+// 작업 중 심박 상한 140bpm 은 ACGIH 열스트레스 TLV(미국 10 CFR 851 채택)의
+// "지속(수 분) 심박 > 180 - 나이" 기준을 40세에 적용한 값이다. 작업자 나이를 헬멧이 모르기
+// 때문에 한 값으로 둔다. 건설 작업 중 평균 심박은 100~115bpm 수준이라 이보다 낮게 잡으면
+// 평소 작업만으로도 계속 경고가 난다.
 const float BPM_MIN_NORMAL   = 40.0f;
 const float BPM_MAX_NORMAL   = 140.0f;
 const float SPO2_MIN_NORMAL  = 92.0f;
+
+// 위 범위를 벗어난 상태가 이 시간 이상 이어져야 이상으로 본다. ACGIH 기준도 순간값이 아니라
+// "지속(수 분)" 심박이고, PPG 는 움직이면 한두 번씩 튀는 값이 나와 순간값으로 판정하면 오탐이 많다.
+// 시연 때 빨리 보여 주려면 줄여도 된다.
+const unsigned long VITALS_ABNORMAL_SUSTAINED_MS = 120000UL;  // 2분
 
 // ── 미착용/신호없음 판정 임계값 ────────────────────────────
 const long IR_FINGER_THRESHOLD = 15000;  // 이 값보다 낮으면 피부 미접촉으로 간주
@@ -99,6 +108,20 @@ float baselineHrvMean = 0;
 bool heatConditionActive = false;
 unsigned long heatConditionStartMs = 0;
 bool lastHeatRiskAbnormal = false;
+
+// ── 심박/SpO2 범위 이탈 지속 타이머 (0 이면 지금 범위 안) ─────
+unsigned long bpmOutStartMs = 0;
+unsigned long spo2OutStartMs = 0;
+
+/** 조건이 VITALS_ABNORMAL_SUSTAINED_MS 이상 계속 참이었는지. 조건이 깨지면 타이머를 지운다. */
+bool sustainedFor(bool conditionNow, unsigned long& startMs) {
+  if (!conditionNow) {
+    startMs = 0;
+    return false;
+  }
+  if (startMs == 0) startMs = millis();
+  return millis() - startMs >= VITALS_ABNORMAL_SUSTAINED_MS;
+}
 
 // ── 서버 전송용: 최근 HRV 이탈(피로도) 판정 캐시 ─────────────
 bool lastHrvAbnormal = false;
@@ -289,8 +312,10 @@ void updateVitalsBuffer(float gyroStd) {
     // 표본이 부족하면 baselineReady는 false로 유지, 다음 윈도우에서 계속 수집 시도
   }
 
-  bool bpmAbnormal = (lastBpm > 0) && (lastBpm < BPM_MIN_NORMAL || lastBpm > BPM_MAX_NORMAL);
-  bool spo2Abnormal = (lastSpo2 > 0) && (lastSpo2 < SPO2_MIN_NORMAL);
+  bool bpmOutNow = (lastBpm > 0) && (lastBpm < BPM_MIN_NORMAL || lastBpm > BPM_MAX_NORMAL);
+  bool spo2OutNow = (lastSpo2 > 0) && (lastSpo2 < SPO2_MIN_NORMAL);
+  bool bpmAbnormal = sustainedFor(bpmOutNow, bpmOutStartMs);
+  bool spo2Abnormal = sustainedFor(spo2OutNow, spo2OutStartMs);
 
   // ── HRV 개인 기준선 이탈 판정 (절대값이 아니라 이 사람 기준선 대비) ──
   bool hrvAbnormal = baselineReady && lastHrv > 0
