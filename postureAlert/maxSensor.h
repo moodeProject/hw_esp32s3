@@ -38,7 +38,7 @@ const float SPO2_MIN_NORMAL  = 92.0f;
 // 위 범위를 벗어난 상태가 이 시간 이상 이어져야 이상으로 본다. ACGIH 기준도 순간값이 아니라
 // "지속(수 분)" 심박이고, PPG 는 움직이면 한두 번씩 튀는 값이 나와 순간값으로 판정하면 오탐이 많다.
 // 시연 때 빨리 보여 주려면 줄여도 된다.
-const unsigned long VITALS_ABNORMAL_SUSTAINED_MS = 120000UL;  // 2분
+const unsigned long VITALS_ABNORMAL_SUSTAINED_MS = 15000UL;  // 15초 (시연용)
 
 // ── 미착용/신호없음 판정 임계값 ────────────────────────────
 const long IR_FINGER_THRESHOLD = 15000;  // 이 값보다 낮으면 피부 미접촉으로 간주
