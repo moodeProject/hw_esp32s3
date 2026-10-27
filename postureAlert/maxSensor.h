@@ -129,11 +129,22 @@ bool lastHrvAbnormal = false;
 // ═══════════════════════════════════════════════════════
 // 초기화
 // ═══════════════════════════════════════════════════════
+// MAX30102 가 응답했는지. false 면 updateVitalsBuffer() 가 읽지 않고 주기적으로 다시 붙어 본다.
+bool maxReady = false;
+unsigned long maxRetryMs = 0;
+int maxRetryCount = 0;
+const unsigned long MAX_RETRY_INTERVAL_MS = 5000;
+#define MAX30102_ADDR 0x57
+
 bool initMaxSensor() {
   if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
-    Serial.println("[MAX30102] 연결 실패");
+    // 시리얼 모니터에서 원인을 바로 좁힐 수 있게 무엇을 확인할지까지 찍는다
+    Serial.println("[MAX30102] 연결 실패 — I2C 주소 0x57 응답 없음");
+    Serial.println("[MAX30102]   확인: SDA->D4, SCL->D5, VIN->3V3, GND->GND, 모듈 핀 납땜, 뒷면 전압 점퍼(3.3V)");
+    maxReady = false;
     return false;
   }
+  maxReady = true;
 
   particleSensor.setup(0x1F, 4, 2, 400, 411, 4096);
   particleSensor.setPulseAmplitudeRed(0x1F);
@@ -241,6 +252,22 @@ float calcSpo2FromWindow() {
 // 매 loop()마다 호출 — 샘플 추가 + 실시간 BPM 갱신
 // ═══════════════════════════════════════════════════════
 void updateVitalsBuffer(float gyroStd) {
+  // 센서가 안 붙어 있으면 읽지 않는다. 없는 장치를 매 루프 읽으면 I2C 타임아웃이 쌓여
+  // 추락 감지 루프까지 느려진다. 대신 5초마다 다시 붙어 보고, 그때마다 상태를 로그로 남긴다.
+  if (!maxReady) {
+    unsigned long now = millis();
+    if (now - maxRetryMs < MAX_RETRY_INTERVAL_MS) return;
+    maxRetryMs = now;
+    maxRetryCount++;
+    Wire.beginTransmission(MAX30102_ADDR);
+    if (Wire.endTransmission() != 0) {
+      Serial.printf("[MAX30102] 여전히 응답 없음 (재시도 %d회) — 심박/SpO2 측정 중지 상태\n", maxRetryCount);
+      return;
+    }
+    Serial.println("[MAX30102] 응답 확인 — 다시 초기화합니다");
+    if (!initMaxSensor()) return;
+  }
+
   // 새 값이 있을 때만 읽음 (getIR/getRed처럼 최대 0.25초씩 기다리지 않음)
   // → MAX30102가 잠깐 멈춰도 추락 감지 루프(50Hz)는 느려지지 않음
   particleSensor.check();

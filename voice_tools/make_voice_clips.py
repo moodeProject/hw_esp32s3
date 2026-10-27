@@ -28,7 +28,12 @@ CLIPS = [
     ("UNCONSCIOUS", "의식불명으로 판별되어 관리자에게 연락을 취하고 있습니다."),
     ("HEATSTROKE", "열사병 위험이 있으니 휴식을 취해주세요."),
     ("CHECK_RESPONSE", "괜찮으시면 고개를 움직여 주세요."),
+    # 헬멧 카메라 영상에서 위험이 확정됐을 때(서버 응답 hazardWarning). 앞에 경고음 3번을 붙인다.
+    ("HAZARD_AHEAD", "전방에 위험 요소가 있습니다. 조심하세요."),
 ]
+
+# 문장 앞에 경고음(띠띠띠)을 붙일 클립
+BEEP_PREFIX = {"HAZARD_AHEAD": 3}
 
 PS_TEMPLATE = r"""
 Add-Type -AssemblyName System.Speech
@@ -66,6 +71,17 @@ def load_pcm16(path: str) -> np.ndarray:
     return data.astype(np.int16)
 
 
+def beeps(count: int) -> np.ndarray:
+    """1.2kHz 짧은 경고음 count 번 + 문장 앞 쉼. 앞뒤를 살짝 줄여 딸깍 소리를 없앤다."""
+    t = np.arange(int(SAMPLE_RATE * 0.12)) / SAMPLE_RATE
+    tone = np.sin(2 * np.pi * 1200 * t)
+    fade = np.minimum(1.0, np.minimum(t, t[::-1]) / 0.005)
+    tone = (tone * fade * 32767 * 0.7).astype(np.int16)
+    gap = np.zeros(int(SAMPLE_RATE * 0.09), dtype=np.int16)
+    tail = np.zeros(int(SAMPLE_RATE * 0.25), dtype=np.int16)
+    return np.concatenate([np.concatenate([tone, gap])] * count + [tail])
+
+
 def main() -> None:
     out_header = sys.argv[1] if len(sys.argv) > 1 else "voiceClips.h"
     lines = [
@@ -83,6 +99,8 @@ def main() -> None:
             wav = os.path.join(tmp, f"{name}.wav")
             synthesize(text, wav, tmp)
             pcm = load_pcm16(wav)
+            if name in BEEP_PREFIX:
+                pcm = np.concatenate([beeps(BEEP_PREFIX[name]), pcm])
             print(f"{name}: {len(pcm) / SAMPLE_RATE:.2f}s, {pcm.nbytes} bytes")
             lines.append(f"// \"{text}\"")
             lines.append(f"static const int16_t VOICE_{name}[{len(pcm)}] = {{")

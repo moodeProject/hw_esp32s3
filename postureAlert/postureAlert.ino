@@ -7,6 +7,12 @@
 //   낙상 후 10초 움직임 없음      -> "괜찮으시면 고개를 움직여 주세요." (본인 확인, 관리자 전송 전)
 //   그 뒤 20초 더 움직임 없음     -> "의식불명으로 판별되어 관리자에게 연락을 취하고 있습니다."
 //   폭염 + 고심박 + 휴식 없음     -> "열사병 위험이 있으니 휴식을 취해주세요."
+//   헬멧 카메라 영상 위험 확정    -> "(띠띠띠) 전방에 위험 요소가 있습니다. 조심하세요."
+//     서버가 센서 전송 응답에 hazardWarning 을 실어 준다. 영상 단독이면 관리자 대시보드에는
+//     안 올라가고 이 경고로만 끝나며, 센서 이상이 겹치면 서버가 위험 이벤트로 올린다.
+//
+// 카메라: 같은 보드의 OV3660 을 :81/stream 으로 내보낸다 (cameraStream.h).
+//   라즈베리파이가 이 스트림을 AI 서버로 중계한다. 빌드 시 PSRAM=opi 필요.
 //
 // 설계 원칙(아키텍처 표 그대로):
 //   1) 휘청거림/자세붕괴(IMU) 감지 -> 네트워크 없이 즉시 경고음 (수 ms 반응)
@@ -39,6 +45,7 @@
 #include "maxSensor.h"
 #include "fallDetector.h"   // 온보드 낙상 감지 (FastAPI /predict 이식)
 #include "voicePlayer.h"    // MAX98357A 안내 음성 (기존 버저 대체)
+#include "cameraStream.h"   // 헬멧 시점 MJPEG 스트림 (라즈베리파이 -> AI 서버)
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
@@ -570,6 +577,25 @@ struct SendMsg {
 };
 QueueHandle_t sendQueue = NULL;        // 한 칸짜리 우편함 (안 나간 메시지는 최신 것으로 덮어씀)
 volatile bool fallDelivered = false;   // 낙상이 실린 메시지를 서버가 받았으면 true
+long lastHazardWarningSeq = 0;         // 마지막으로 안내한 영상 경고 번호 (sendTask 전용)
+
+/**
+ * 서버 응답의 영상 경고(data.hazardWarningSeq)를 보고, 새 번호일 때만 경고 음성을 낸다.
+ * 서버는 경고를 10초 동안 매 응답에 실어 주므로 번호로 중복을 거른다.
+ */
+void handleHazardWarning(const String& body) {
+  StaticJsonDocument<64> filter;
+  filter["data"]["hazardWarningSeq"] = true;
+  filter["data"]["hazardWarning"] = true;
+  StaticJsonDocument<192> res;
+  if (deserializeJson(res, body, DeserializationOption::Filter(filter)) != DeserializationError::Ok) return;
+
+  long seq = res["data"]["hazardWarningSeq"] | 0L;
+  if (seq == 0 || seq == lastHazardWarningSeq) return;
+  lastHazardWarningSeq = seq;
+  Serial.printf("[영상 경고] %s (seq=%ld)\n", (const char*)(res["data"]["hazardWarning"] | "?"), seq);
+  requestVoice(VoiceClip::HAZARD_AHEAD);
+}
 
 void sendTask(void* param) {
   SendMsg msg;
@@ -582,6 +608,7 @@ void sendTask(void* param) {
     int code = http.POST((uint8_t*)msg.body, strlen(msg.body));
     Serial.printf("[raw 전송] 응답코드 %d\n", code);
     if (code > 0 && msg.hadFall) fallDelivered = true;
+    if (code == 200) handleHazardWarning(http.getString());
     http.end();
   }
 }
@@ -640,6 +667,25 @@ void sendSensorData(float ax, float ay, float az, float gx, float gy, float gz) 
   if (!pendingFallDetected) pendingFallConfidence = 0.0f;
 }
 
+/**
+ * 부팅 때 센서 I2C 버스(SDA=D4, SCL=D5)에 붙은 장치를 시리얼 모니터에 찍는다.
+ * 센서가 "인식 안 됨"일 때 배선 문제인지(아무것도 없음) 모듈 하나 문제인지(하나만 없음) 바로 구분하려고.
+ */
+void logI2cDevices() {
+  bool mpuFound = false, maxFound = false;
+  Serial.print("[I2C] 발견된 장치:");
+  for (uint8_t addr = 0x08; addr < 0x78; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() != 0) continue;
+    Serial.printf(" 0x%02X", addr);
+    if (addr == MPU_ADDR) mpuFound = true;
+    if (addr == MAX30102_ADDR) maxFound = true;
+  }
+  Serial.println();
+  Serial.printf("[I2C] MPU6050(0x68): %s / MAX30102(0x57): %s\n",
+                mpuFound ? "인식됨" : "없음", maxFound ? "인식됨" : "없음");
+}
+
 // ═══════════════════════════════════════════════════════
 // setup / loop
 // ═══════════════════════════════════════════════════════
@@ -671,6 +717,7 @@ void setup() {
   Serial.println("MPU6050 초기화 완료");
 
   delay(200);
+  logI2cDevices();
   initMaxSensor();
 
   WiFi.begin(ssid, password);
@@ -682,6 +729,8 @@ void setup() {
     retry++;
   }
   Serial.println(WiFi.status() == WL_CONNECTED ? "\nWi-Fi 연결 완료" : "\nWi-Fi 실패 (계속 진행, 음성 안내는 동작함)");
+  WiFi.setSleep(false);  // 절전 모드면 카메라 스트림이 끊기듯 느려진다
+  startCameraStream();
 
   lastRestMs = millis();  // 착용 시작 시점을 마지막 휴식으로 간주
   if (xTaskCreatePinnedToCore(weatherTask, "Weather", 8192, NULL, 1, NULL, 0) != pdPASS) {
