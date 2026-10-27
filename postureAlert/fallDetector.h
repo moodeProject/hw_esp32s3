@@ -15,7 +15,7 @@
 #include <math.h>
 // 시연용 모델을 쓰려면 아래 줄 맨 앞의 // 를 지우세요 (fallModel_demo.h 사용)
 // 다시 원래 모델로 돌리려면 // 를 다시 붙이세요
-#define FALL_USE_DEMO_MODEL
+// #define FALL_USE_DEMO_MODEL
 #ifdef FALL_USE_DEMO_MODEL
 #include "fallModel_demo.h"
 #else
