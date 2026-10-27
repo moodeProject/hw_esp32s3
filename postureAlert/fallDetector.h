@@ -13,7 +13,17 @@
 // ─────────────────────────────────────────────────────────
 #pragma once
 #include <math.h>
+// 시연용 모델을 쓰려면 아래 줄 맨 앞의 // 를 지우세요 (fallModel_demo.h 사용)
+// 다시 원래 모델로 돌리려면 // 를 다시 붙이세요
+// #define FALL_USE_DEMO_MODEL
+#ifdef FALL_USE_DEMO_MODEL
+#include "fallModel_demo.h"
+#else
 #include "fallModel.h"
+#endif
+
+// 낙상 판정 기준값 (시리얼 모니터에서 '+' / '-' 로 0.05씩 조절. 전원을 끄면 아래 값으로 돌아감)
+float fallThreshold = 0.5f;
 
 #define FALL_WINDOW_SIZE 50   // app.py WINDOW_SIZE와 반드시 동일
 
@@ -120,6 +130,6 @@ FallResult predictFall(const float window[][6]) {
 
   FallResult r;
   r.confidence = probSum / FALL_N_TREES;
-  r.fallDetected = r.confidence > 0.5f;
+  r.fallDetected = r.confidence > fallThreshold;
   return r;
 }

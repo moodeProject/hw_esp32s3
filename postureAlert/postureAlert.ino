@@ -670,7 +670,7 @@ void setup() {
   Wire.endTransmission();
   Serial.println("MPU6050 초기화 완료");
 
-  delay(200);  // MAX30102 안정화 대기
+  delay(200);
   initMaxSensor();
 
   WiFi.begin(ssid, password);
@@ -721,6 +721,8 @@ void loop() {
     char c = Serial.read();
     if (c >= '1' && c <= '5') requestVoice((VoiceClip)(c - '1'));
     else if (c == 'c') startPostureCalibration();
+    else if (c == '+') { fallThreshold = min(0.95f, fallThreshold + 0.05f); Serial.printf("[낙상 기준값] %.2f\n", fallThreshold); }
+    else if (c == '-') { fallThreshold = max(0.05f, fallThreshold - 0.05f); Serial.printf("[낙상 기준값] %.2f\n", fallThreshold); }
   }
 
   unsigned long now = millis();
