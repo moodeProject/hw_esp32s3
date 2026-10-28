@@ -60,18 +60,20 @@
 #define SAMPLE_INTERVAL_MS 20     // 50Hz
 #define POSTURE_WINDOW_SIZE 150   // 3초 (50Hz x 3s)
 
-// ── 임계값 (1차: 실측 데이터(정상 330 / stagger 33 / collapse 25 윈도우) 기반) ──
-// tilt_max, gyro_std, tilt_mean은 normal-abnormal 분포가 아직 상당히 겹쳐서
-// (analyze_thresholds.py 참고) 중앙값 사이 지점으로 보수적으로 잡음 — 실착용
-// 테스트하면서 오탐/미탐 보고 재조정 필수. slope는 아직 구분력이 없어서
-// 원래 초기값 유지.
-// TODO: 아래 값은 절대 기울기(Z축 수직 가정) 기준으로 잡은 것. tilt를 착용 기준 자세(g0)
-// 대비 상대 기울기로 바꿨으므로 상대 기울기 기준으로 재튜닝 필요(수집 데이터 분석 후 갱신,
-// data_collection/analyze_thresholds.py --relative).
-const float THRESH_STUMBLE_TILT_DEG   = 80.0f;
-const float THRESH_STUMBLE_GYRO_STD   = 45.0f;
-const float THRESH_COLLAPSE_TILT_DEG  = 40.0f;
-const float THRESH_COLLAPSE_SLOPE     = 0.0f;    // deg/sample (실측 slope 중앙값이 거의 0이라 완화)
+// ── 임계값 (2차: 2026-10-29 상대 기울기 재수집 — session 12~14, data_collection/analyze_posture_v2.py) ──
+// 3초 윈도우(0.5초 간격) 정상 110 / 휘청 20 / 쓰러짐 10개. 기울기는 착용 기준 자세(g0) 대비.
+// 휘청: 가속도 크기 변동폭(max-min)이 정상(최대 1.19g)과 휘청(최소 1.21g)을 가장 잘 갈랐고,
+//       쭈그려 앉기(변동 1.19g)와 겹치지 않게 기울기 최대 60° 이상을 같이 본다. → 정상 0%, 휘청 4종 100%
+//       (예전 기울기 80°+자이로 표준편차 45 는 휘청 4종 중 1종만 잡았음)
+// 쓰러짐: 숙인 채로 머무는지(평균·최근 1초 기울기)와 천천히 무너지는지(회전 최대)를 같이 본다.
+//       의자에 앉기(빠르게 앉음, 회전 최대 167°/s)와 물건 줍기(평균 13°)는 제외됨 → 정상 0%
+// 수집량이 시나리오당 1회라 쓰러짐 데이터가 적다(벽 미끄러지기 도중 센서 접촉 끊김). 추가 수집 후 재조정.
+const float THRESH_STUMBLE_ACC_RANGE_G   = 1.2f;    // 윈도우 안 가속도 크기 max-min (g)
+const float THRESH_STUMBLE_TILT_MAX_DEG  = 60.0f;
+const float THRESH_COLLAPSE_TILT_MEAN_DEG = 35.0f;
+const float THRESH_COLLAPSE_TILT_LAST_DEG = 40.0f;  // 윈도우 마지막 1초 평균 — 지금도 숙여져 있는지
+const float THRESH_COLLAPSE_GYRO_MAX_DPS  = 150.0f; // 오프셋 뺀 회전 크기 최대 — 이보다 빠르면 일부러 앉는 동작
+const unsigned long POSTURE_HOLD_MS     = 1000UL;   // 이상 판정이 이만큼 이어져야 경고 (순간 튐 방지)
 
 // ── WiFi / 서버 ────────────────────────────────────────────
 const char* ssid      = "TODO";  // 각자 환경에 맞게 채워서 사용 (커밋 금지)
@@ -328,6 +330,8 @@ void updatePostureCalibration(float ax, float ay, float az, float gx, float gy, 
   postureCalibrated = true;
   Serial.printf("[자세] 기준 자세 저장 완료 (g0=%.3f, %.3f, %.3f, 정지 시 자이로 오프셋=%.1f, %.1f, %.1f °/s)\n",
                 g0x, g0y, g0z, gyroOffX, gyroOffY, gyroOffZ);
+  // 보정이 끝났는지 겉으로 알 수 없어서, 판정이 시작됐다는 걸 소리로 알린다
+  requestVoice(VoiceClip::CALIB_DONE);
 }
 
 static float med3(float a, float b, float c) {
@@ -387,22 +391,40 @@ PostureStatus classifyPosture() {
   // 기준 자세가 없으면 기울기를 믿을 수 없으므로 자세 경고는 내지 않는다
   if (!postureCalibrated) return PostureStatus::STABLE;
 
-  // 단순 선형회귀 기울기 (시간 t = 0..N-1)
-  float n = POSTURE_WINDOW_SIZE;
-  float sumT = 0, sumTT = 0, sumTTilt = 0;
+  // 가속도 크기 변동폭(g), 마지막 1초 기울기 평균, 오프셋 뺀 회전 크기 최대
+  const int LAST_N = 50;  // 1초 @ 50Hz
+  float accMin = 1e9, accMax = -1e9, tiltLastSum = 0, gyroRotMax = 0;
   for (int i = 0; i < POSTURE_WINDOW_SIZE; i++) {
-    sumT += i;
-    sumTT += (float)i * i;
-    sumTTilt += i * tilt[i];
+    int idx = (bufIndex + i) % POSTURE_WINDOW_SIZE;
+    float acc = sqrtf(bufAx[idx] * bufAx[idx] + bufAy[idx] * bufAy[idx] + bufAz[idx] * bufAz[idx]) / 9.8f;
+    if (acc < accMin) accMin = acc;
+    if (acc > accMax) accMax = acc;
+    if (i >= POSTURE_WINDOW_SIZE - LAST_N) tiltLastSum += tilt[i];
+    float dx = bufGx[idx] - gyroOffX, dy = bufGy[idx] - gyroOffY, dz = bufGz[idx] - gyroOffZ;
+    float rot = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (rot > gyroRotMax) gyroRotMax = rot;
   }
-  float slope = (n * sumTTilt - sumT * tiltSum) / (n * sumTT - sumT * sumT);
+  float accRange = accMax - accMin;
+  float tiltLast = tiltLastSum / LAST_N;
 
-  bool isCollapse = (tiltMean > THRESH_COLLAPSE_TILT_DEG) && (slope > THRESH_COLLAPSE_SLOPE);
-  bool isStumble = (tiltMax > THRESH_STUMBLE_TILT_DEG) && (gyroStd > THRESH_STUMBLE_GYRO_STD);
+  bool isCollapse = (tiltMean > THRESH_COLLAPSE_TILT_MEAN_DEG) && (tiltLast > THRESH_COLLAPSE_TILT_LAST_DEG) &&
+                    (gyroRotMax < THRESH_COLLAPSE_GYRO_MAX_DPS);
+  bool isStumble = (accRange >= THRESH_STUMBLE_ACC_RANGE_G) && (tiltMax >= THRESH_STUMBLE_TILT_MAX_DEG);
 
-  if (isCollapse) return PostureStatus::COLLAPSE;
-  if (isStumble) return PostureStatus::STUMBLE;
-  return PostureStatus::STABLE;
+  PostureStatus raw = isCollapse ? PostureStatus::COLLAPSE
+                    : isStumble  ? PostureStatus::STUMBLE
+                                 : PostureStatus::STABLE;
+
+  // 이상 판정이 POSTURE_HOLD_MS 동안 계속 이어질 때만 내보낸다 (한 순간 걸쳤다 빠지는 경우 제외).
+  static unsigned long unstableSinceMs = 0;
+  if (raw == PostureStatus::STABLE) {
+    unstableSinceMs = 0;
+    return PostureStatus::STABLE;
+  }
+  unsigned long now = millis();
+  if (unstableSinceMs == 0) unstableSinceMs = now;
+  if (now - unstableSinceMs < POSTURE_HOLD_MS) return PostureStatus::STABLE;
+  return raw;
 }
 
 // ═══════════════════════════════════════════════════════
