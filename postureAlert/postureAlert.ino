@@ -128,7 +128,7 @@ enum class SafetyLevel   { NORMAL, RECOMMEND, ACTION_REQUIRED };
 
 // ── 함수 프로토타입 (Arduino 자동 프로토타입 생성기가 enum class 반환형을
 //    잘못 파싱해서 뒤죽박죽 만드는 문제가 있어 직접 선언해둔다) ──
-void readMpu(float &ax, float &ay, float &az, float &gx, float &gy, float &gz);
+bool readMpu(float &ax, float &ay, float &az, float &gx, float &gy, float &gz);
 void resetCalibrationAccum();
 void startPostureCalibration();
 void updatePostureCalibration(float ax, float ay, float az, float gx, float gy, float gz);
@@ -177,6 +177,7 @@ bool latestHealthAbnormal = false;
 // 보정 중 누적한 자이로 평균에서 얼마나 벗어나는지(= 오프셋을 뺀 실제 회전)로 본다.
 #define CALIB_SAMPLES 150             // 3초 @ 50Hz
 const float CALIB_MAX_GYRO_DPS = 30.0f;  // 자이로 평균에서 이보다 벗어나면(움직이면) 처음부터 다시 누적
+const int CALIB_MOVE_SAMPLES = 5;        // 이만큼 연달아(0.1초) 벗어나야 움직임으로 본다. 그보다 짧으면 노이즈로 버림
 float g0x = 0.0f, g0y = 0.0f, g0z = 1.0f;  // 기준 단위벡터
 bool postureCalibrated = false;
 float calibSumX = 0, calibSumY = 0, calibSumZ = 0;
@@ -241,11 +242,12 @@ volatile unsigned long weatherOkMs = 0;  // 마지막으로 기상 조회에 성
 // ═══════════════════════════════════════════════════════
 // MPU6050 읽기
 // ═══════════════════════════════════════════════════════
-void readMpu(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
+/** 14바이트를 다 못 읽으면 false. 이때 값은 0xFF 등 쓰레기라 판정에 넣으면 안 된다. */
+bool readMpu(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x3B);
-  Wire.endTransmission(false);
-  Wire.requestFrom(MPU_ADDR, 14);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(MPU_ADDR, 14) != 14) return false;
 
   int16_t axRaw = Wire.read() << 8 | Wire.read();
   int16_t ayRaw = Wire.read() << 8 | Wire.read();
@@ -261,6 +263,7 @@ void readMpu(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
   gx = gxRaw / 16.4f;           // deg/s (±2000°/s 기준: 16.4 = 1°/s)
   gy = gyRaw / 16.4f;
   gz = gzRaw / 16.4f;
+  return true;
 }
 
 // ═══════════════════════════════════════════════════════
@@ -292,12 +295,19 @@ void startPostureCalibration() {
 void updatePostureCalibration(float ax, float ay, float az, float gx, float gy, float gz) {
   if (postureCalibrated) return;
 
+  // 정지 중에도 I2C 노이즈로 한 샘플씩 튀는 값(-0.1,-0.1,-0.1 등)이 섞여 들어와서, 튄 샘플 하나로
+  // 처음부터 다시 세면 보정이 영영 안 끝난다. 그래서 튄 샘플은 버리고, 연달아 벗어날 때만 움직임으로 본다.
+  static int calibOutlierRun = 0;
   if (calibCount > 0) {
     float dx = gx - calibGyroSumX / calibCount;
     float dy = gy - calibGyroSumY / calibCount;
     float dz = gz - calibGyroSumZ / calibCount;
-    if (sqrtf(dx * dx + dy * dy + dz * dz) > CALIB_MAX_GYRO_DPS) resetCalibrationAccum();
+    if (sqrtf(dx * dx + dy * dy + dz * dz) > CALIB_MAX_GYRO_DPS) {
+      if (++calibOutlierRun < CALIB_MOVE_SAMPLES) return;  // 한두 번 튄 값 — 버린다
+      resetCalibrationAccum();                              // 계속 벗어남 — 실제로 움직이는 중
+    }
   }
+  calibOutlierRun = 0;
 
   calibSumX += ax; calibSumY += ay; calibSumZ += az;
   calibGyroSumX += gx; calibGyroSumY += gy; calibGyroSumZ += gz;
@@ -318,6 +328,22 @@ void updatePostureCalibration(float ax, float ay, float az, float gx, float gy, 
   postureCalibrated = true;
   Serial.printf("[자세] 기준 자세 저장 완료 (g0=%.3f, %.3f, %.3f, 정지 시 자이로 오프셋=%.1f, %.1f, %.1f °/s)\n",
                 g0x, g0y, g0z, gyroOffX, gyroOffY, gyroOffZ);
+}
+
+static float med3(float a, float b, float c) {
+  return fmaxf(fminf(a, b), fminf(fmaxf(a, b), c));
+}
+
+/** 6축 각각 최근 3샘플(이번 포함)의 중간값으로 바꾼다. 처음 두 샘플은 그대로 통과. */
+void medianFilter3(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
+  static float hist[2][6];
+  static int seen = 0;
+  float cur[6] = {ax, ay, az, gx, gy, gz};
+  float out[6];
+  for (int k = 0; k < 6; k++) out[k] = seen >= 2 ? med3(hist[0][k], hist[1][k], cur[k]) : cur[k];
+  for (int k = 0; k < 6; k++) { hist[0][k] = hist[1][k]; hist[1][k] = cur[k]; }
+  if (seen < 2) seen++;
+  ax = out[0]; ay = out[1]; az = out[2]; gx = out[3]; gy = out[4]; gz = out[5];
 }
 
 /** 현재 가속도 벡터와 기준 자세 g0 사이의 각도(도). 보정 전에는 g0=(0,0,1)이라 절대 기울기. */
@@ -779,7 +805,8 @@ void loop() {
   lastSampleMs = now;
 
   float ax, ay, az, gx, gy, gz;
-  readMpu(ax, ay, az, gx, gy, gz);
+  // I2C 읽기 실패 샘플은 버린다. 섞이면 정지 상태도 움직임으로 보여 기준 자세 저장이 끝나지 않는다.
+  if (!readMpu(ax, ay, az, gx, gy, gz)) return;
   updatePostureCalibration(ax, ay, az, gx, gy, gz);
 
   // [디버그] 1초마다 현재 상대 tilt 출력 — 정자세 0.1~1.6° 확인됨(2026-10-19), 필요할 때 주석 해제
@@ -796,6 +823,10 @@ void loop() {
     sendSensorData(ax, ay, az, gx, gy, gz);
   }
 
+  // 정지 중에도 I2C 노이즈로 한 샘플만 튀는 값(기울기 137°, 자이로 수백 °/s)이 섞여 들어와
+  // 그 한 개로 휘청거림이 판정됐다. 최근 3개 중간값을 넣어 한 샘플짜리 튐만 지운다(지연 20ms).
+  // 실제 움직임은 여러 샘플에 걸쳐 이어지므로 그대로 남는다.
+  medianFilter3(ax, ay, az, gx, gy, gz);
   bufAx[bufIndex] = ax; bufAy[bufIndex] = ay; bufAz[bufIndex] = az;
   bufGx[bufIndex] = gx; bufGy[bufIndex] = gy; bufGz[bufIndex] = gz;
   bufIndex = (bufIndex + 1) % POSTURE_WINDOW_SIZE;
